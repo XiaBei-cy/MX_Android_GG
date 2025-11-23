@@ -5,6 +5,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
@@ -122,62 +124,55 @@ fun TutorialDialog(
         onDismissRequest = onDismiss,
         confirmButton = {
             Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                // Skip button (only show if not on last page)
-                if (pagerState.currentPage < steps.size - 1) {
-                    TextButton(onClick = onComplete) {
-                        Text("跳过")
-                    }
-                }
-
-                // Next/Complete button
-                if (pagerState.currentPage < steps.size - 1) {
-                    Button(
+                // Left side: Previous button
+                if (pagerState.currentPage > 0) {
+                    TextButton(
                         onClick = {
                             coroutineScope.launch {
-                                pagerState.animateScrollToPage(pagerState.currentPage + 1)
+                                pagerState.animateScrollToPage(pagerState.currentPage - 1)
                             }
                         }
                     ) {
-                        Text("下一步")
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowForward,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp)
-                        )
+                        Text("上一步")
                     }
                 } else {
-                    // Last page: show practice button if available
-                    if (onStartPractice != null) {
-                        OutlinedButton(onClick = onStartPractice) {
+                    Spacer(modifier = Modifier.width(1.dp))
+                }
+
+                // Right side: action buttons
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (pagerState.currentPage < steps.size - 1) {
+                        // Skip button
+                        TextButton(onClick = onComplete) {
+                            Text("跳过")
+                        }
+                        // Next button
+                        Button(
+                            onClick = {
+                                coroutineScope.launch {
+                                    pagerState.animateScrollToPage(pagerState.currentPage + 1)
+                                }
+                            }
+                        ) {
+                            Text("下一步")
+                            Spacer(modifier = Modifier.width(4.dp))
                             Icon(
-                                imageVector = Icons.Default.School,
+                                imageVector = Icons.AutoMirrored.Filled.ArrowForward,
                                 contentDescription = null,
                                 modifier = Modifier.size(16.dp)
                             )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("进入练习")
+                        }
+                    } else {
+                        Button(onClick = onComplete) {
+                            Text("开始使用")
                         }
                     }
-                    Button(onClick = onComplete) {
-                        Text("开始使用")
-                    }
-                }
-            }
-        },
-        dismissButton = {
-            // Previous button (only show if not on first page)
-            if (pagerState.currentPage > 0) {
-                TextButton(
-                    onClick = {
-                        coroutineScope.launch {
-                            pagerState.animateScrollToPage(pagerState.currentPage - 1)
-                        }
-                    }
-                ) {
-                    Text("上一步")
                 }
             }
         },
@@ -195,6 +190,23 @@ fun TutorialDialog(
                         .height(320.dp)
                 ) { page ->
                     TutorialStepContent(step = steps[page])
+                }
+
+                // Practice button on last page
+                if (onStartPractice != null && pagerState.currentPage == steps.size - 1) {
+                    Spacer(modifier = Modifier.height(12.dp))
+                    OutlinedButton(
+                        onClick = onStartPractice,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.School,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("进入练习模式")
+                    }
                 }
 
                 Spacer(modifier = Modifier.height(16.dp))
@@ -230,7 +242,8 @@ fun TutorialDialog(
 private fun TutorialStepContent(step: TutorialStep) {
     Column(
         modifier = Modifier
-            .fillMaxSize()
+            .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
             .padding(8.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Top
