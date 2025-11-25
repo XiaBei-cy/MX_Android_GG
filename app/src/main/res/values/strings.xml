@@ -240,6 +240,7 @@
     <string name="regions_searched">已搜索区域:</string>
     <string name="address_searched">已搜索地址:</string>
     <string name="results_found">找到结果:</string>
+    <string name="hide">隐藏</string>
 
     <!-- 主题名称 -->
     <string name="theme_tech">霓虹科技</string>

@@ -58,6 +58,13 @@ class SearchDialog(
     private var progressDialog: SearchProgressDialog? = null
     private var progressBuffer: ByteBuffer? = null
 
+    // 搜索状态标志
+    private var isSearching = false
+    private var currentIsRefineSearch = false
+
+    // 退出全屏回调（用于隐藏按钮点击）
+    var onExitFullscreen: (() -> Unit)? = null
+
     /**
      * 读取进度buffer中的数据
      */
@@ -92,6 +99,10 @@ class SearchDialog(
      * 初始化进度追踪
      */
     private fun setupProgressTracking(isRefineSearch: Boolean) {
+        // 更新搜索状态
+        isSearching = true
+        currentIsRefineSearch = isRefineSearch
+
         // 创建 20 字节的 DirectByteBuffer
         progressBuffer = ByteBuffer.allocateDirect(20).apply {
             order(ByteOrder.nativeOrder())
@@ -101,7 +112,14 @@ class SearchDialog(
         SearchEngine.setProgressBuffer(progressBuffer!!)
 
         // 显示进度对话框
-        progressDialog = SearchProgressDialog(context, isRefineSearch).apply {
+        progressDialog = SearchProgressDialog(
+            context = context,
+            isRefineSearch = isRefineSearch,
+            onHideClick = {
+                // 隐藏按钮点击：退出全屏但保持搜索状态
+                onExitFullscreen?.invoke()
+            }
+        ).apply {
             show()
         }
 
@@ -118,6 +136,9 @@ class SearchDialog(
 
         SearchEngine.clearProgressBuffer()
         progressBuffer = null
+
+        // 更新搜索状态
+        isSearching = false
     }
 
     private inner class SearchCallback : SearchProgressCallback {
@@ -172,6 +193,38 @@ class SearchDialog(
     fun release() {
         cleanupProgressTracking()
         searchScope.cancel()
+    }
+
+    /**
+     * 隐藏进度对话框（但保持搜索状态）
+     * 用于退出全屏时隐藏 UI，但后台搜索继续
+     */
+    fun hideProgressDialog() {
+        progressDialog?.dismiss()
+        progressDialog = null
+        // 注意：不清理 progressBuffer 和进度监控协程，让搜索继续
+    }
+
+    /**
+     * 如果正在搜索，重新显示进度对话框
+     * 用于重新进入全屏时恢复 UI 显示
+     */
+    fun showProgressDialogIfSearching() {
+        if (isSearching && progressDialog == null) {
+            // 重新创建并显示 SearchProgressDialog
+            progressDialog = SearchProgressDialog(
+                context = context,
+                isRefineSearch = currentIsRefineSearch,
+                onHideClick = {
+                    // 隐藏按钮点击：退出全屏但保持搜索状态
+                    onExitFullscreen?.invoke()
+                }
+            ).apply {
+                show()
+                // 同步当前进度
+                updateProgress(readProgressData())
+            }
+        }
     }
 
     @SuppressLint("ClickableViewAccessibility", "SetTextI18n")

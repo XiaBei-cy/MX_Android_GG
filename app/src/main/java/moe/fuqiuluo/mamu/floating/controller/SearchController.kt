@@ -31,7 +31,8 @@ class SearchController(
     context: Context,
     binding: FloatingSearchLayoutBinding,
     notification: NotificationOverlay,
-    private val onShowSearchDialog: () -> Unit
+    private val onShowSearchDialog: () -> Unit,
+    private val onExitFullscreen: (() -> Unit)? = null
 ) : FloatingController<FloatingSearchLayoutBinding>(context, binding, notification) {
     // 搜索结果列表适配器
     private lateinit var searchResultAdapter: SearchResultAdapter
@@ -42,6 +43,9 @@ class SearchController(
     // 过滤对话框状态
     private val filterDialogState = FilterDialogState()
     private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+
+    // 持久化的 SearchDialog 实例
+    private var searchDialog: SearchDialog? = null
 
     override fun initialize() {
         setupToolbar()
@@ -302,15 +306,47 @@ class SearchController(
             return
         }
 
-        val dialog = SearchDialog(
-            context = context,
-            notification = notification,
-            searchDialogState = searchDialogState,
-            clipboardManager = clipboardManager,
-            onSearchCompleted = { onSearchCompleted(it) },
-            onRefineCompleted = { onRefineCompleted() }
-        )
-        dialog.show()
+        // 搜索结束移除单例
+        val allSearchComplete = {
+            searchDialog = null
+        }
+        // 单例模式：复用 SearchDialog 实例
+        if (searchDialog == null) {
+            searchDialog = SearchDialog(
+                context = context,
+                notification = notification,
+                searchDialogState = searchDialogState,
+                clipboardManager = clipboardManager,
+                onSearchCompleted = {
+                    onSearchCompleted(it)
+                    allSearchComplete()
+                },
+                onRefineCompleted = {
+                    onRefineCompleted()
+                    allSearchComplete()
+                }
+            ).apply {
+                // 设置退出全屏回调
+                onExitFullscreen = this@SearchController.onExitFullscreen
+            }
+        }
+        searchDialog?.show()
+    }
+
+    /**
+     * 隐藏搜索进度对话框（如果正在搜索）
+     * 用于退出全屏时隐藏进度 UI，但后台搜索继续
+     */
+    fun hideSearchProgressIfNeeded() {
+        searchDialog?.hideProgressDialog()
+    }
+
+    /**
+     * 如果正在搜索，重新显示搜索进度对话框
+     * 用于重新进入全屏时恢复进度 UI
+     */
+    fun showSearchProgressIfNeeded() {
+        searchDialog?.showProgressDialogIfSearching()
     }
 
     private fun onRefineCompleted() {

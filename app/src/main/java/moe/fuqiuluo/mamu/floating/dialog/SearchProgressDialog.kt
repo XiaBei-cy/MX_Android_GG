@@ -27,7 +27,8 @@ data class SearchProgressData(
  */
 class SearchProgressDialog(
     context: Context,
-    private val isRefineSearch: Boolean
+    private val isRefineSearch: Boolean,
+    private val onHideClick: (() -> Unit)? = null
 ) : BaseDialog(context) {
     private lateinit var binding: DialogSearchProgressBinding
 
@@ -46,6 +47,11 @@ class SearchProgressDialog(
 
         if (isRefineSearch) {
             binding.tvCounter.setText(R.string.address_searched)
+        }
+
+        // 设置隐藏按钮点击事件
+        binding.btnHide.setOnClickListener {
+            onHideClick?.invoke()
         }
 
         // 初始状态

@@ -220,7 +220,7 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
         }
 
         fullscreenBinding.btnCloseFullscreen.setOnClickListener {
-            hideFullscreen()
+            hideFullscreen() // fullscreenBinding.btnCloseFullscreen
         }
 
         fullscreenBinding.tabSettings.setOnClickListener {
@@ -252,6 +252,10 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
             onShowSearchDialog = {
                 val clipboardManager = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
                 searchController.showSearchDialog(clipboardManager)
+            },
+            onExitFullscreen = {
+                // 退出全屏：隐藏搜索进度对话框但保持搜索状态
+                hideFullscreen() // SearchController called
             }
         )
 
@@ -310,6 +314,9 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
     }
 
     private fun hideFullscreen() {
+        // 隐藏搜索进度对话框（如果正在搜索）
+        searchController.hideSearchProgressIfNeeded()
+
         fullscreenView.visibility = View.GONE
         floatingIconView.visibility = View.VISIBLE
     }
@@ -317,6 +324,9 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
     private fun showFullscreen() {
         fullscreenView.visibility = View.VISIBLE
         floatingIconView.visibility = View.GONE
+
+        // 重新显示搜索进度对话框（如果正在搜索）
+        searchController.showSearchProgressIfNeeded()
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {

@@ -220,6 +220,15 @@
     <string name="home_supported_abis">Supported ABIs</string>
     <string name="home_error_title">Error</string>
 
+    <!-- Search Progress Dialog -->
+    <string name="searching">Searching...</string>
+    <string name="progress_zero">0%</string>
+    <string name="count_zero">0</string>
+    <string name="regions_searched">Regions Searched:</string>
+    <string name="address_searched">Addresses Searched:</string>
+    <string name="results_found">Results Found:</string>
+    <string name="hide">Hide</string>
+
     <!-- Theme Names -->
     <string name="theme_cyan">Cyan</string>
     <string name="theme_cyan_desc">Tech Style</string>
