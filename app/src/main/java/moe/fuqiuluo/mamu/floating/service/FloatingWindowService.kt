@@ -77,6 +77,10 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        return START_STICKY
+    }
+
     @SuppressLint("ClickableViewAccessibility")
     override fun onCreate() {
         super.onCreate()
