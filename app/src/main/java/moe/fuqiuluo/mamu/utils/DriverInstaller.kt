@@ -1,6 +1,5 @@
 package moe.fuqiuluo.mamu.utils
 
-import android.app.Application
 import android.content.Context
 import android.os.Process
 import android.util.Log
@@ -14,6 +13,68 @@ import java.io.File
  */
 object DriverInstaller {
     private const val TAG = "DriverInstaller"
+
+    /**
+     * 解析 supreme 输出，提取 status 和 driver_fd
+     * 优先使用 JSON 解析，失败则回退到正则匹配
+     */
+    private inline fun parseSupremeOutput(output: String): Pair<Boolean, Int?> {
+        // 先尝试 JSON 解析
+        val jsonResult = tryParseJson(output)
+        if (jsonResult != null) {
+            return jsonResult
+        }
+
+        // JSON 解析失败，回退到正则匹配
+        Log.d(TAG, "JSON parse failed, trying regex")
+        return tryParseRegex(output)
+    }
+
+    private inline fun tryParseJson(output: String): Pair<Boolean, Int?>? {
+        val jsonStart = output.indexOf('{')
+        val jsonEnd = output.lastIndexOf('}')
+
+        if (jsonStart == -1 || jsonEnd == -1 || jsonEnd <= jsonStart) {
+            return null
+        }
+
+        return try {
+            val jsonStr = output.substring(jsonStart, jsonEnd + 1)
+            val json = JSONObject(jsonStr)
+            val status = json.optString("status", "")
+
+            if (status == "success") {
+                val driverFd = json.getInt("driver_fd")
+                Log.d(TAG, "Driver installed successfully (JSON), fd: $driverFd")
+                WuwaDriver.setDriverFd(driverFd)
+                Pair(true, driverFd)
+            } else {
+                Log.w(TAG, "Supreme status: $status")
+                Pair(false, null)
+            }
+        } catch (e: Exception) {
+            Log.d(TAG, "JSON parse exception: ${e.message}")
+            null
+        }
+    }
+
+    private inline fun tryParseRegex(output: String): Pair<Boolean, Int?> {
+        val statusRegex = """"status"\s*:\s*"(\w+)"""".toRegex()
+        val fdRegex = """"driver_fd"\s*:\s*(\d+)""".toRegex()
+
+        val statusMatch = statusRegex.find(output)
+        val fdMatch = fdRegex.find(output)
+
+        if (statusMatch != null && statusMatch.groupValues[1] == "success" && fdMatch != null) {
+            val driverFd = fdMatch.groupValues[1].toInt()
+            Log.d(TAG, "Driver installed successfully (regex), fd: $driverFd")
+            WuwaDriver.setDriverFd(driverFd)
+            return Pair(true, driverFd)
+        }
+
+        Log.w(TAG, "Failed to parse supreme output")
+        return Pair(false, null)
+    }
 
     /**
      * 检查驱动是否已安装
@@ -45,21 +106,14 @@ object DriverInstaller {
 
             when (result) {
                 is ShellResult.Success -> {
-                    val output = result.output.trim()
-                    try {
-                        val json = JSONObject(output)
-                        val status = json.getString("status")
-                        if (status == "success") {
-                            val driverFd = json.getInt("driver_fd")
-                            Log.d(TAG, "Driver installed successfully, fd: $driverFd")
-                            // 设置驱动fd
-                            WuwaDriver.setDriverFd(driverFd)
-                            return Pair(true, driverFd)
-                        }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Failed to parse supreme output", e)
-                    }
-                    Pair(false, null)
+                    Log.d(TAG, "Supreme output: ${result.output}")
+                    parseSupremeOutput(result.output)
+                }
+
+                is ShellResult.Error -> {
+                    // supreme 可能因为 stack corruption 返回非零退出码，但输出仍然有效
+                    Log.d(TAG, "Supreme error output: ${result.message}")
+                    parseSupremeOutput(result.message)
                 }
 
                 else -> Pair(false, null)

@@ -3,6 +3,7 @@ package moe.fuqiuluo.mamu.utils
 import android.content.Context
 import android.os.Build
 import android.util.Log
+import com.topjohnwu.superuser.Shell
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -204,7 +205,7 @@ object AntiKillProtectionManager {
      * 执行单个保护命令
      */
     private suspend fun executeProtectionCommand(
-        shell: PersistentRootShell,
+        shell: Shell,
         command: String
     ): Boolean {
         return withTimeoutOrNull(5.seconds) {

@@ -7,6 +7,7 @@ import android.os.Build
 import android.os.Process
 import android.provider.Settings
 import android.util.Log
+import com.topjohnwu.superuser.Shell
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -226,7 +227,7 @@ object PermissionManager {
      * 授予单个权限
      */
     private suspend fun grantPermission(
-        shell: PersistentRootShell,
+        shell: Shell,
         packageName: String,
         permission: String,
     ): Boolean {
@@ -272,7 +273,7 @@ object PermissionManager {
      * 授予AppOp权限
      */
     private suspend fun grantAppOp(
-        shell: PersistentRootShell,
+        shell: Shell,
         packageName: String,
         appOp: String
     ): Boolean {

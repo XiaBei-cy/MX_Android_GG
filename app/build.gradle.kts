@@ -76,6 +76,10 @@ dependencies {
     implementation(libs.fastutil)
     implementation("org.jetbrains.kotlinx:kotlinx-io-jvm:0.1.16")
 
+    // libsu - Root Shell library by topjohnwu (Magisk author)
+    val libsuVersion = "6.0.0"
+    implementation("com.github.topjohnwu.libsu:core:$libsuVersion")
+
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)

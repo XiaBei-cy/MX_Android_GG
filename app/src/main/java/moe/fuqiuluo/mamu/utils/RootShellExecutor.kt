@@ -1,9 +1,9 @@
 package moe.fuqiuluo.mamu.utils
-import android.os.Build
+
+import android.content.Context
 import android.util.Log
-import java.io.BufferedReader
-import java.io.BufferedWriter
-import java.util.concurrent.TimeUnit
+import com.topjohnwu.superuser.Shell
+import moe.fuqiuluo.mamu.R
 import java.util.concurrent.TimeoutException
 
 /**
@@ -16,284 +16,93 @@ sealed class ShellResult {
 }
 
 /**
- * Shell 配置
- */
-data class ShellConfig(
-    val timeoutMs: Long = 5000L,
-    val mergeErrorStream: Boolean = true,
-    val suCmd: String,
-)
-
-/**
- * Root Shell 接口
- */
-interface RootShell : AutoCloseable {
-    fun execute(
-        suCmd: String,
-        command: String,
-        config: ShellConfig = ShellConfig(suCmd = suCmd)
-    ): ShellResult
-
-    fun executeAsync(
-        suCmd: String,
-        command: String,
-        config: ShellConfig = ShellConfig(suCmd = suCmd),
-        callback: (ShellResult) -> Unit
-    )
-
-    fun executeNoWait(suCmd: String, command: String)
-}
-
-/**
- * 一次性 Root Shell 实现
- */
-internal object OneshotRootShell : RootShell {
-    private const val TAG = "OneshotRootShell"
-
-    override fun execute(suCmd: String, command: String, config: ShellConfig): ShellResult {
-        return try {
-            val process = Runtime.getRuntime().exec(arrayOf(suCmd, "-c", command))
-
-            val outputBuilder = StringBuilder()
-            val outputReader = Thread {
-                process.inputStream.bufferedReader().use { reader ->
-                    reader.forEachLine { line ->
-                        outputBuilder.appendLine(line)
-                    }
-                }
-            }
-
-            val errorBuilder = StringBuilder()
-            val errorReader = if (config.mergeErrorStream) {
-                null
-            } else {
-                Thread {
-                    process.errorStream.bufferedReader().use { reader ->
-                        reader.forEachLine { line ->
-                            errorBuilder.appendLine(line)
-                        }
-                    }
-                }
-            }
-
-            outputReader.start()
-            errorReader?.start()
-
-            val finished = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                process.waitFor(config.timeoutMs, TimeUnit.MILLISECONDS)
-            } else run {
-                val startTime = System.currentTimeMillis()
-                while (System.currentTimeMillis() - startTime < config.timeoutMs) {
-                    try {
-                        process.exitValue()
-                        return@run true
-                    } catch (e: IllegalThreadStateException) {
-                        Thread.sleep(50)
-                    }
-                }
-                false
-            }
-
-            if (!finished) {
-                process.destroy()
-                return ShellResult.Timeout(config.timeoutMs)
-            }
-
-            outputReader.join()
-            errorReader?.join()
-
-            val exitCode = process.exitValue()
-            val output = if (config.mergeErrorStream) {
-                outputBuilder.toString().trim()
-            } else {
-                (outputBuilder.toString() + errorBuilder.toString()).trim()
-            }
-
-            if (exitCode == 0) {
-                ShellResult.Success(output, exitCode)
-            } else {
-                ShellResult.Error(
-                    output.ifEmpty { "Command failed with exit code $exitCode" },
-                    exitCode
-                )
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to execute command: $command", e)
-            ShellResult.Error(e.message ?: "Unknown error", -1)
-        }
-    }
-
-    override fun executeAsync(
-        suCmd: String,
-        command: String,
-        config: ShellConfig,
-        callback: (ShellResult) -> Unit
-    ) {
-        Thread {
-            callback(execute(suCmd, command, config))
-        }.start()
-    }
-
-    override fun executeNoWait(suCmd: String, command: String) {
-        Thread {
-            try {
-                Runtime.getRuntime().exec(arrayOf(suCmd, "-c", command))
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to execute command (no wait): $command", e)
-            }
-        }.start()
-    }
-
-    override fun close() {
-        // oneshot 无需清理
-    }
-}
-
-/**
- * 持久化 Root Shell 实现
- */
-class PersistentRootShell internal constructor(
-    private val defaultConfig: ShellConfig
-) : RootShell {
-    private val TAG = "PersistentRootShell"
-
-    private val process: Process by lazy {
-        if (defaultConfig.mergeErrorStream) {
-            ProcessBuilder(defaultConfig.suCmd)
-                .redirectErrorStream(true)
-                .start()
-        } else {
-            Runtime.getRuntime().exec(defaultConfig.suCmd)
-        }
-    }
-
-    private val writer: BufferedWriter by lazy {
-        process.outputStream.bufferedWriter()
-    }
-
-    private val reader: BufferedReader by lazy {
-        process.inputStream.bufferedReader()
-    }
-
-    private val marker = "<<<MAMU_CMD_END>>>"
-    private var closed = false
-
-    @Synchronized
-    override fun execute(suCmd: String, command: String, config: ShellConfig): ShellResult {
-        if (closed) {
-            return ShellResult.Error("Shell is closed", -1)
-        }
-
-        return try {
-            // 修复：用引号包围 marker，防止被解析为 here-string
-            val cmd = "$command; echo '$marker' \$?\n".also {
-                Log.d(TAG, "Executing command: $it")
-            }
-
-            writer.write(cmd)
-            writer.flush()
-
-            val startTime = System.currentTimeMillis()
-            val output = StringBuilder()
-            var exitCode = -1
-            var foundMarker = false
-
-            while (!foundMarker) {
-                if (System.currentTimeMillis() - startTime > config.timeoutMs) {
-                    return ShellResult.Timeout(config.timeoutMs)
-                }
-
-                val line = reader.readLine() ?: break
-
-                if (line.startsWith(marker)) {
-                    val parts = line.split(" ")
-                    exitCode = parts.getOrNull(1)?.toIntOrNull() ?: -1
-                    foundMarker = true
-                } else {
-                    output.appendLine(line)
-                }
-            }
-
-            val result = output.toString().trim()
-            if (exitCode == 0) {
-                ShellResult.Success(result, exitCode)
-            } else {
-                ShellResult.Error(
-                    result.ifEmpty { "Command failed with exit code $exitCode" },
-                    exitCode
-                )
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to execute command: $command", e)
-            ShellResult.Error(e.message ?: "Unknown error", -1)
-        }
-    }
-
-    override fun executeAsync(
-        suCmd: String,
-        command: String,
-        config: ShellConfig,
-        callback: (ShellResult) -> Unit
-    ) {
-        Thread {
-            callback(execute(suCmd, command, config))
-        }.start()
-    }
-
-    @Synchronized
-    override fun executeNoWait(suCmd: String, command: String) {
-        if (closed) {
-            Log.w(TAG, "Shell is closed, cannot execute: $command")
-            return
-        }
-
-        try {
-            // 修复：不需要再次使用 suCmd，已经在 root shell 中了
-            writer.write("$command\n")
-            writer.flush()
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to execute command (no wait): $command", e)
-        }
-    }
-
-    @Synchronized
-    override fun close() {
-        if (closed) return
-
-        try {
-            writer.write("exit\n")
-            writer.flush()
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                process.waitFor(1000, TimeUnit.MILLISECONDS)
-            } else {
-                process.waitFor()
-            }
-            writer.close()
-            reader.close()
-            process.destroy()
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to close shell", e)
-        } finally {
-            closed = true
-        }
-    }
-}
-
-/**
  * Root Shell 执行器
+ * 使用 libsu 实现，提供稳定可靠的 root shell 执行能力
  */
 object RootShellExecutor {
     private const val TAG = "RootShellExecutor"
 
+    init {
+        // 配置 libsu
+        // 不使用 FLAG_REDIRECT_STDERR，分开捕获 stdout 和 stderr
+        Shell.enableVerboseLogging = false
+        Shell.setDefaultBuilder(
+            Shell.Builder.create()
+                .setInitializers(ShellInit::class.java)
+                .setFlags(Shell.FLAG_MOUNT_MASTER)
+                .setTimeout(10)
+        )
+    }
+
+    class ShellInit : Shell.Initializer() {
+        override fun onInit(context: Context, shell: Shell): Boolean {
+            val bashrc = context.resources.openRawResource(R.raw.bashrc)
+            shell.newJob().add(bashrc).exec()
+            return true
+        }
+    }
+
+    /**
+     * 使用自定义 su 命令配置 Shell
+     */
+    fun getShellBuilder(suCmd: String): Shell.Builder {
+        return Shell.Builder.create()
+            .setFlags(Shell.FLAG_MOUNT_MASTER)
+            .setTimeout(10)
+            .setCommands(suCmd)
+    }
+
     /**
      * 一次性执行命令
+     * @param suCmd su 命令路径（如 "su" 或自定义路径）
+     * @param command 要执行的命令
+     * @param timeoutMs 超时时间（毫秒），libsu 内部会处理超时
      */
     fun exec(
         suCmd: String,
         command: String,
         timeoutMs: Long = 5000L
-    ): ShellResult =
-        OneshotRootShell.execute(suCmd, command, ShellConfig(suCmd = suCmd, timeoutMs = timeoutMs))
+    ): ShellResult {
+        return try {
+            val result = if (suCmd == RootConfigManager.DEFAULT_ROOT_COMMAND) {
+                // 使用默认 shell
+                Log.d(TAG, "Shell.cmd($command)")
+                Shell.cmd(command).exec()
+            } else {
+                // 使用自定义 su 命令创建新 shell
+                val shell = getShellBuilder(suCmd).build()
+                Log.d(TAG, "Shell.cmd2($command)")
+                shell.newJob().add(command).exec()
+            }
+
+            val stdout = result.out.joinToString("\n")
+            val stderr = result.err.joinToString("\n")
+            val exitCode = result.code
+
+            // 合并 stdout 和 stderr，确保都能被解析
+            val combinedOutput = buildString {
+                if (stdout.isNotEmpty()) append(stdout)
+                if (stderr.isNotEmpty()) {
+                    if (isNotEmpty()) append("\n")
+                    append(stderr)
+                }
+            }
+
+            Log.d(TAG, "Command result - exitCode: $exitCode, stdout: $stdout, stderr: $stderr")
+
+            if (result.isSuccess) {
+                ShellResult.Success(combinedOutput, exitCode)
+            } else {
+                ShellResult.Error(
+                    combinedOutput.ifEmpty { "Command failed with exit code $exitCode" },
+                    exitCode
+                )
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to execute command: $command", e)
+            ShellResult.Error(e.message ?: "Unknown error", -1)
+        }
+    }
 
     /**
      * 批量一次性执行命令
@@ -307,29 +116,68 @@ object RootShellExecutor {
     }
 
     /**
-     * 创建持久化 Shell
-     */
-    fun persistent(
-        suCmd: String,
-        config: ShellConfig = ShellConfig(suCmd = suCmd)
-    ): PersistentRootShell {
-        return PersistentRootShell(config)
-    }
-
-    /**
-     * DSL 风格：使用持久化 Shell 执行多条命令
-     */
-    inline fun <T> withPersistentShell(
-        suCmd: String,
-        config: ShellConfig = ShellConfig(suCmd = suCmd),
-        block: PersistentRootShell.() -> T
-    ): T = persistent(suCmd = suCmd, config = config).use(block)
-
-    /**
      * Fire and forget - 不等待结果
      */
     fun execNoWait(suCmd: String, command: String) {
-        OneshotRootShell.executeNoWait(suCmd, command)
+        try {
+            if (suCmd == RootConfigManager.DEFAULT_ROOT_COMMAND) {
+                Shell.cmd(command).submit()
+            } else {
+                val shell = getShellBuilder(suCmd).build()
+                shell.newJob().add(command).submit()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to execute command (no wait): $command", e)
+        }
+    }
+
+    /**
+     * DSL 风格：使用 libsu Shell 执行多条命令
+     * 注意：libsu 使用全局 Shell，无需手动管理生命周期
+     */
+    inline fun <T> withPersistentShell(
+        suCmd: String,
+        block: Shell.() -> T
+    ): T {
+        val shell = if (suCmd == RootConfigManager.DEFAULT_ROOT_COMMAND) {
+            Shell.getShell()
+        } else {
+            getShellBuilder(suCmd).build()
+        }
+        return shell.block()
+    }
+}
+
+/**
+ * Shell 扩展：异步执行命令
+ */
+fun Shell.executeAsync(
+    suCmd: String,
+    command: String,
+    callback: (ShellResult) -> Unit
+) {
+    newJob().add(command).submit { result ->
+        val stdout = result.out.joinToString("\n")
+        val stderr = result.err.joinToString("\n")
+        val exitCode = result.code
+
+        val combinedOutput = buildString {
+            if (stdout.isNotEmpty()) append(stdout)
+            if (stderr.isNotEmpty()) {
+                if (isNotEmpty()) append("\n")
+                append(stderr)
+            }
+        }
+
+        val shellResult = if (result.isSuccess) {
+            ShellResult.Success(combinedOutput, exitCode)
+        } else {
+            ShellResult.Error(
+                combinedOutput.ifEmpty { "Command failed with exit code $exitCode" },
+                exitCode
+            )
+        }
+        callback(shellResult)
     }
 }
 
