@@ -8,8 +8,8 @@ import moe.fuqiuluo.mamu.R
  * 应用主题枚举
  */
 enum class AppTheme(
-    @StringRes val displayNameRes: Int,
-    @StringRes val descriptionRes: Int,
+    @param:StringRes val displayNameRes: Int,
+    @param:StringRes val descriptionRes: Int,
     val primaryLight: Color,
     val secondaryLight: Color,
     val tertiaryLight: Color,
@@ -17,103 +17,15 @@ enum class AppTheme(
     val secondaryDark: Color,
     val tertiaryDark: Color
 ) {
-    TECH(
-        displayNameRes = R.string.theme_tech,
-        descriptionRes = R.string.theme_tech_desc,
-        primaryLight = TechColors.primary40,
-        secondaryLight = TechColors.secondary40,
-        tertiaryLight = TechColors.tertiary40,
-        primaryDark = TechColors.primary80,
-        secondaryDark = TechColors.secondary80,
-        tertiaryDark = TechColors.tertiary80
-    ),
-
-    CYAN(
-        displayNameRes = R.string.theme_cyan,
-        descriptionRes = R.string.theme_cyan_desc,
-        primaryLight = CyanColors.primary40,
-        secondaryLight = CyanColors.secondary40,
-        tertiaryLight = CyanColors.tertiary40,
-        primaryDark = CyanColors.primary80,
-        secondaryDark = CyanColors.secondary80,
-        tertiaryDark = CyanColors.tertiary80
-    ),
-
-    BLUE(
-        displayNameRes = R.string.theme_blue,
-        descriptionRes = R.string.theme_blue_desc,
-        primaryLight = BlueColors.primary40,
-        secondaryLight = BlueColors.secondary40,
-        tertiaryLight = BlueColors.tertiary40,
-        primaryDark = BlueColors.primary80,
-        secondaryDark = BlueColors.secondary80,
-        tertiaryDark = BlueColors.tertiary80
-    ),
-
-    GREEN(
-        displayNameRes = R.string.theme_green,
-        descriptionRes = R.string.theme_green_desc,
-        primaryLight = GreenColors.primary40,
-        secondaryLight = GreenColors.secondary40,
-        tertiaryLight = GreenColors.tertiary40,
-        primaryDark = GreenColors.primary80,
-        secondaryDark = GreenColors.secondary80,
-        tertiaryDark = GreenColors.tertiary80
-    ),
-
-    ORANGE(
-        displayNameRes = R.string.theme_orange,
-        descriptionRes = R.string.theme_orange_desc,
-        primaryLight = OrangeColors.primary40,
-        secondaryLight = OrangeColors.secondary40,
-        tertiaryLight = OrangeColors.tertiary40,
-        primaryDark = OrangeColors.primary80,
-        secondaryDark = OrangeColors.secondary80,
-        tertiaryDark = OrangeColors.tertiary80
-    ),
-
-    RED(
-        displayNameRes = R.string.theme_red,
-        descriptionRes = R.string.theme_red_desc,
-        primaryLight = RedColors.primary40,
-        secondaryLight = RedColors.secondary40,
-        tertiaryLight = RedColors.tertiary40,
-        primaryDark = RedColors.primary80,
-        secondaryDark = RedColors.secondary80,
-        tertiaryDark = RedColors.tertiary80
-    ),
-
-    PURPLE(
-        displayNameRes = R.string.theme_purple,
-        descriptionRes = R.string.theme_purple_desc,
-        primaryLight = PurpleColors.primary40,
-        secondaryLight = PurpleColors.secondary40,
-        tertiaryLight = PurpleColors.tertiary40,
-        primaryDark = PurpleColors.primary80,
-        secondaryDark = PurpleColors.secondary80,
-        tertiaryDark = PurpleColors.tertiary80
-    ),
-
-    PINK(
-        displayNameRes = R.string.theme_pink,
-        descriptionRes = R.string.theme_pink_desc,
-        primaryLight = PinkColors.primary40,
-        secondaryLight = PinkColors.secondary40,
-        tertiaryLight = PinkColors.tertiary40,
-        primaryDark = PinkColors.primary80,
-        secondaryDark = PinkColors.secondary80,
-        tertiaryDark = PinkColors.tertiary80
-    ),
-
-    AMBER(
-        displayNameRes = R.string.theme_amber,
-        descriptionRes = R.string.theme_amber_desc,
-        primaryLight = AmberColors.primary40,
-        secondaryLight = AmberColors.secondary40,
-        tertiaryLight = AmberColors.tertiary40,
-        primaryDark = AmberColors.primary80,
-        secondaryDark = AmberColors.secondary80,
-        tertiaryDark = AmberColors.tertiary80
+    MONOCHROME(
+        displayNameRes = R.string.theme_monochrome,
+        descriptionRes = R.string.theme_monochrome_desc,
+        primaryLight = MonochromeColors.primary40,
+        secondaryLight = MonochromeColors.secondary40,
+        tertiaryLight = MonochromeColors.tertiary40,
+        primaryDark = MonochromeColors.primary80,
+        secondaryDark = MonochromeColors.secondary80,
+        tertiaryDark = MonochromeColors.tertiary80
     ),
 
     INDIGO(
@@ -128,14 +40,11 @@ enum class AppTheme(
     );
 
     companion object {
-        /**
-         * 从字符串名称获取主题
-         */
         fun fromName(name: String?): AppTheme {
             if (name == null) {
-                return TECH
+                return MONOCHROME
             }
-            return entries.find { it.name == name } ?: TECH
+            return entries.find { it.name == name } ?: MONOCHROME
         }
     }
 }

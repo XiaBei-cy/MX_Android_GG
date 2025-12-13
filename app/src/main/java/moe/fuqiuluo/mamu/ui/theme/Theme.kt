@@ -40,14 +40,20 @@ private fun createLightColorScheme(theme: AppTheme): ColorScheme {
 
 @Composable
 fun MXTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(),
     content: @Composable () -> Unit
 ) {
     val context = LocalContext.current
+    val systemInDarkTheme = isSystemInDarkTheme()
 
-    // 监听主题变化
     val currentTheme by ThemeManager.currentTheme.collectAsState()
     val useDynamicColor by ThemeManager.useDynamicColor.collectAsState()
+    val darkMode by ThemeManager.darkMode.collectAsState()
+
+    val darkTheme = when (darkMode) {
+        DarkMode.FOLLOW_SYSTEM -> systemInDarkTheme
+        DarkMode.LIGHT -> false
+        DarkMode.DARK -> true
+    }
 
     val colorScheme = when {
         // 使用动态颜色（Android 12+）

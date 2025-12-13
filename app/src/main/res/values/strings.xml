@@ -253,6 +253,8 @@
     <string name="hide">隐藏</string>
 
     <!-- 主题名称 -->
+    <string name="theme_monochrome">黑白</string>
+    <string name="theme_monochrome_desc">极简现代</string>
     <string name="theme_tech">霓虹科技</string>
     <string name="theme_tech_desc">炫酷霓虹科技风</string>
     <string name="theme_cyan">青色</string>

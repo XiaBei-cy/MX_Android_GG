@@ -236,6 +236,10 @@
     <string name="hide">Hide</string>
 
     <!-- Theme Names -->
+    <string name="theme_monochrome">Monochrome</string>
+    <string name="theme_monochrome_desc">Minimal Modern</string>
+    <string name="theme_tech">Tech</string>
+    <string name="theme_tech_desc">Neon Cyberpunk</string>
     <string name="theme_cyan">Cyan</string>
     <string name="theme_cyan_desc">Tech Style</string>
     <string name="theme_blue">Blue</string>
