@@ -1,18 +1,18 @@
-//! JNI methods for SearchEngine
+//! JNI methods for SearchEngine.
 
-use std::ops::Not;
-use crate::search::engine::{SEARCH_ENGINE_MANAGER, SearchProgressCallback};
-use crate::search::parser::parse_search_query;
-use crate::search::types::ValueType;
 use crate::core::DRIVER_MANAGER;
 use crate::ext::jni::{JniResult, JniResultExt};
 use crate::search::SearchResultItem;
+use crate::search::engine::{SEARCH_ENGINE_MANAGER, SHARED_BUFFER_SIZE, SearchProgressCallback};
+use crate::search::parser::parse_search_query;
+use crate::search::types::ValueType;
 use anyhow::anyhow;
 use jni::objects::{GlobalRef, JIntArray, JLongArray, JObject, JString, JValue};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jobjectArray};
 use jni::{JNIEnv, JavaVM};
 use jni_macro::jni_method;
-use log::error;
+use log::{Level, error, log_enabled};
+use std::ops::Not;
 use std::sync::Arc;
 
 struct JniCallback {
@@ -83,8 +83,7 @@ fn format_value(bytes: &[u8], typ: ValueType) -> String {
         ValueType::Qword => {
             if bytes.len() >= 8 {
                 let value = u64::from_le_bytes([
-                    bytes[0], bytes[1], bytes[2], bytes[3],
-                    bytes[4], bytes[5], bytes[6], bytes[7]
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
                 ]);
                 format!("{}", value)
             } else {
@@ -102,8 +101,7 @@ fn format_value(bytes: &[u8], typ: ValueType) -> String {
         ValueType::Double => {
             if bytes.len() >= 8 {
                 let value = f64::from_le_bytes([
-                    bytes[0], bytes[1], bytes[2], bytes[3],
-                    bytes[4], bytes[5], bytes[6], bytes[7]
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
                 ]);
                 format!("{}", value)
             } else {
@@ -113,7 +111,12 @@ fn format_value(bytes: &[u8], typ: ValueType) -> String {
     }
 }
 
-#[jni_method(70, "moe/fuqiuluo/mamu/driver/SearchEngine", "nativeInitSearchEngine", "(JLjava/lang/String;J)Z")]
+#[jni_method(
+    70,
+    "moe/fuqiuluo/mamu/driver/SearchEngine",
+    "nativeInitSearchEngine",
+    "(JLjava/lang/String;J)Z"
+)]
 pub fn jni_init_search_engine(
     mut env: JNIEnv,
     _class: JObject,
@@ -135,7 +138,158 @@ pub fn jni_init_search_engine(
     .or_throw(&mut env)
 }
 
-#[jni_method(70, "moe/fuqiuluo/mamu/driver/SearchEngine", "nativeSearch", "(Ljava/lang/String;I[JZLmoe/fuqiuluo/mamu/driver/SearchProgressCallback;)J")]
+/// Sets the shared buffer for progress communication. Requires at least 32 bytes.
+#[jni_method(
+    70,
+    "moe/fuqiuluo/mamu/driver/SearchEngine",
+    "nativeSetSharedBuffer",
+    "(Ljava/nio/ByteBuffer;)Z"
+)]
+pub fn jni_set_shared_buffer(mut env: JNIEnv, _class: JObject, buffer: JObject) -> jboolean {
+    (|| -> JniResult<jboolean> {
+        let buffer = (&buffer).into();
+        let ptr = env.get_direct_buffer_address(buffer)?;
+        let capacity = env.get_direct_buffer_capacity(buffer)?;
+
+        if capacity < SHARED_BUFFER_SIZE {
+            return Err(anyhow!("Buffer too small, need at least {} bytes", SHARED_BUFFER_SIZE));
+        }
+
+        let mut manager = SEARCH_ENGINE_MANAGER
+            .write()
+            .map_err(|_| anyhow!("Failed to acquire SearchEngineManager write lock"))?;
+
+        if manager.set_shared_buffer(ptr, capacity) {
+            Ok(JNI_TRUE)
+        } else {
+            Err(anyhow!("Failed to set shared buffer"))
+        }
+    })()
+    .or_throw(&mut env)
+}
+
+/// Clears the shared buffer.
+#[jni_method(70, "moe/fuqiuluo/mamu/driver/SearchEngine", "nativeClearSharedBuffer", "()V")]
+pub fn jni_clear_shared_buffer(mut env: JNIEnv, _class: JObject) {
+    (|| -> JniResult<()> {
+        let mut manager = SEARCH_ENGINE_MANAGER
+            .write()
+            .map_err(|_| anyhow!("Failed to acquire SearchEngineManager write lock"))?;
+
+        manager.clear_shared_buffer();
+        Ok(())
+    })()
+    .or_throw(&mut env)
+}
+
+/// Starts an async search. Returns immediately. Progress is communicated via the shared buffer.
+#[jni_method(
+    70,
+    "moe/fuqiuluo/mamu/driver/SearchEngine",
+    "nativeStartSearchAsync",
+    "(Ljava/lang/String;I[JZ)Z"
+)]
+pub fn jni_start_search_async(
+    mut env: JNIEnv,
+    _class: JObject,
+    query_str: JString,
+    default_type: jint,
+    regions: JLongArray,
+    use_deep_search: jboolean,
+) -> jboolean {
+    (|| -> JniResult<jboolean> {
+        let query: String = env.get_string(&query_str)?.into();
+
+        let value_type =
+            jint_to_value_type(default_type).ok_or_else(|| anyhow!("Invalid value type: {}", default_type))?;
+
+        let search_query = parse_search_query(&query, value_type).map_err(|e| anyhow!("Parse error: {}", e))?;
+
+        let regions_len = env.get_array_length(&regions)? as usize;
+        if regions_len % 2 != 0 {
+            return Err(anyhow!("Regions array length must be even"));
+        }
+
+        let mut regions_buf = vec![0i64; regions_len];
+        env.get_long_array_region(&regions, 0, &mut regions_buf)?;
+
+        let memory_regions: Vec<(u64, u64)> = regions_buf
+            .chunks(2)
+            .map(|chunk| (chunk[0] as u64, chunk[1] as u64))
+            .collect();
+
+        let mut manager = SEARCH_ENGINE_MANAGER
+            .write()
+            .map_err(|_| anyhow!("Failed to acquire SearchEngineManager write lock"))?;
+
+        manager.start_search_async(search_query, memory_regions, use_deep_search != JNI_FALSE)?;
+
+        Ok(JNI_TRUE)
+    })()
+    .or_throw(&mut env)
+}
+
+/// Starts an async refine search. Returns immediately.
+#[jni_method(
+    70,
+    "moe/fuqiuluo/mamu/driver/SearchEngine",
+    "nativeStartRefineAsync",
+    "(Ljava/lang/String;I)Z"
+)]
+pub fn jni_start_refine_async(mut env: JNIEnv, _class: JObject, query_str: JString, default_type: jint) -> jboolean {
+    (|| -> JniResult<jboolean> {
+        let query: String = env.get_string(&query_str)?.into();
+
+        let value_type =
+            jint_to_value_type(default_type).ok_or_else(|| anyhow!("Invalid value type: {}", default_type))?;
+
+        let search_query = parse_search_query(&query, value_type).map_err(|e| anyhow!("Parse error: {}", e))?;
+
+        let mut manager = SEARCH_ENGINE_MANAGER
+            .write()
+            .map_err(|_| anyhow!("Failed to acquire SearchEngineManager write lock"))?;
+
+        manager.start_refine_async(search_query)?;
+
+        Ok(JNI_TRUE)
+    })()
+    .or_throw(&mut env)
+}
+
+/// Checks if a search is currently running.
+#[jni_method(70, "moe/fuqiuluo/mamu/driver/SearchEngine", "nativeIsSearching", "()Z")]
+pub fn jni_is_searching(mut env: JNIEnv, _class: JObject) -> jboolean {
+    (|| -> JniResult<jboolean> {
+        let manager = SEARCH_ENGINE_MANAGER
+            .read()
+            .map_err(|_| anyhow!("Failed to acquire SearchEngineManager read lock"))?;
+
+        Ok(if manager.is_searching() { JNI_TRUE } else { JNI_FALSE })
+    })()
+    .or_throw(&mut env)
+}
+
+/// Requests cancellation of the current search via CancellationToken.
+#[jni_method(70, "moe/fuqiuluo/mamu/driver/SearchEngine", "nativeRequestCancel", "()V")]
+pub fn jni_request_cancel(mut env: JNIEnv, _class: JObject) {
+    (|| -> JniResult<()> {
+        let manager = SEARCH_ENGINE_MANAGER
+            .read()
+            .map_err(|_| anyhow!("Failed to acquire SearchEngineManager read lock"))?;
+
+        manager.request_cancel();
+        Ok(())
+    })()
+    .or_throw(&mut env)
+}
+
+/// Legacy synchronous search method. Kept for backward compatibility.
+#[jni_method(
+    70,
+    "moe/fuqiuluo/mamu/driver/SearchEngine",
+    "nativeSearch",
+    "(Ljava/lang/String;I[JZLmoe/fuqiuluo/mamu/driver/SearchProgressCallback;)J"
+)]
 pub fn jni_search(
     mut env: JNIEnv,
     _class: JObject,
@@ -181,36 +335,53 @@ pub fn jni_search(
             .write()
             .map_err(|_| anyhow!("Failed to acquire SearchEngineManager write lock"))?;
 
-        let count = manager.search_memory(
-            &search_query,
-            &memory_regions,
-            use_deep_search != JNI_FALSE,
-            callback
-        )?;
+        let count = manager.search_memory(&search_query, &memory_regions, use_deep_search != JNI_FALSE, callback)?;
 
         Ok(count as jlong)
     })()
     .or_throw(&mut env)
 }
 
-#[jni_method(70, "moe/fuqiuluo/mamu/driver/SearchEngine", "nativeGetResults", "(II)[Lmoe/fuqiuluo/mamu/driver/SearchResultItem;")]
+#[jni_method(
+    70,
+    "moe/fuqiuluo/mamu/driver/SearchEngine",
+    "nativeGetResults",
+    "(II)[Lmoe/fuqiuluo/mamu/driver/SearchResultItem;"
+)]
 pub fn jni_get_results(mut env: JNIEnv, _class: JObject, start: jint, size: jint) -> jobjectArray {
     (|| -> JniResult<jobjectArray> {
+        // Use warn level for diagnostic - easier to see in logcat
+        if log_enabled!(Level::Debug) {
+            log::warn!("jni_get_results called: start={}, size={}", start, size);
+        }
         let search_manager = SEARCH_ENGINE_MANAGER
             .read()
             .map_err(|_| anyhow!("Failed to acquire SearchEngineManager read lock"))?;
 
-        let mut results = search_manager.get_results(start as usize, size as usize)?
+        if log_enabled!(Level::Debug) {
+            let total_count = search_manager.get_total_count().unwrap_or(0);
+            // Diagnostic log - always print to help debug timing issues
+            log::warn!(
+                "[DIAG] jni_get_results: total_count={}, requesting start={}, size={}",
+                total_count,
+                start,
+                size
+            );
+        }
+        let mut results = search_manager
+            .get_results(start as usize, size as usize)?
             .into_iter()
             .enumerate()
-            .map(|(index, value)| {
-                (index, value) // 原始索引, SearchResultItem
-            })
+            .map(|(index, value)| (index, value))
             .collect::<Vec<(usize, SearchResultItem)>>();
 
+        if log_enabled!(Level::Debug) {
+            log::warn!("[DIAG] jni_get_results: got {} results", results.len());
+        }
         let filter = search_manager.get_filter();
         if filter.is_active() {
-            results = results.into_iter()
+            results = results
+                .into_iter()
                 .filter(|(_idx, item)| {
                     if filter.enable_address_filter {
                         let addr = match item {
@@ -240,7 +411,8 @@ pub fn jni_get_results(mut env: JNIEnv, _class: JObject, start: jint, size: jint
         let class = env.find_class("moe/fuqiuluo/mamu/driver/ExactSearchResultItem")?;
         let array = env.new_object_array(results.len() as jint, &class, JObject::null())?;
 
-        let driver_manager = DRIVER_MANAGER.read()
+        let driver_manager = DRIVER_MANAGER
+            .read()
             .map_err(|_| anyhow!("Failed to acquire DriverManager read lock"))?;
 
         for (i, (native_position, item)) in results.into_iter().enumerate() {
@@ -250,8 +422,10 @@ pub fn jni_get_results(mut env: JNIEnv, _class: JObject, start: jint, size: jint
                         let size = exact.typ.size();
                         let mut buffer = vec![0u8; size];
 
-                        // 使用统一的内存读取方法，遵循配置的 access_mode
-                        if driver_manager.read_memory_unified(exact.address, &mut buffer, None).is_ok() {
+                        if driver_manager
+                            .read_memory_unified(exact.address, &mut buffer, None)
+                            .is_ok()
+                        {
                             format_value(&buffer, exact.typ)
                         } else {
                             "N/A".to_string()
@@ -267,7 +441,7 @@ pub fn jni_get_results(mut env: JNIEnv, _class: JObject, start: jint, size: jint
                             JValue::Long(native_position as i64),
                             JValue::Long(exact.address as i64),
                             JValue::Int(exact.typ as jint),
-                            JValue::Object(&value_jstring)
+                            JValue::Object(&value_jstring),
                         ],
                     )?
                 },
@@ -291,6 +465,9 @@ pub fn jni_get_total_result_count(mut env: JNIEnv, _class: JObject) -> jlong {
             .map_err(|_| anyhow!("Failed to acquire SearchEngineManager read lock"))?;
 
         let count = manager.get_total_count()?;
+        if log_enabled!(Level::Debug) {
+            log::debug!("jni_get_total_result_count: count = {}", count);
+        }
         Ok(count as jlong)
     })()
     .or_throw(&mut env)
@@ -299,6 +476,10 @@ pub fn jni_get_total_result_count(mut env: JNIEnv, _class: JObject) -> jlong {
 #[jni_method(70, "moe/fuqiuluo/mamu/driver/SearchEngine", "nativeClearSearchResults", "()V")]
 pub fn jni_clear_result(mut env: JNIEnv, _class: JObject) {
     (|| -> JniResult<()> {
+        if log_enabled!(Level::Debug) {
+            log::warn!("jni_clear_result called - clearing all search results");
+        }
+
         let mut manager = SEARCH_ENGINE_MANAGER
             .write()
             .map_err(|_| anyhow!("Failed to acquire SearchEngineManager read lock"))?;
@@ -307,7 +488,7 @@ pub fn jni_clear_result(mut env: JNIEnv, _class: JObject) {
 
         Ok(())
     })()
-        .or_throw(&mut env);
+    .or_throw(&mut env);
 }
 
 #[jni_method(70, "moe/fuqiuluo/mamu/driver/SearchEngine", "nativeRemoveResult", "(I)Z")]
@@ -408,7 +589,13 @@ pub fn jni_get_current_search_mode(mut env: JNIEnv, _class: JObject) -> jint {
     .or_throw(&mut env)
 }
 
-#[jni_method(70, "moe/fuqiuluo/mamu/driver/SearchEngine", "nativeRefineSearch", "(Ljava/lang/String;ILmoe/fuqiuluo/mamu/driver/SearchProgressCallback;)J")]
+/// Legacy synchronous refine search method.
+#[jni_method(
+    70,
+    "moe/fuqiuluo/mamu/driver/SearchEngine",
+    "nativeRefineSearch",
+    "(Ljava/lang/String;ILmoe/fuqiuluo/mamu/driver/SearchProgressCallback;)J"
+)]
 pub fn jni_refine_search(
     mut env: JNIEnv,
     _class: JObject,
@@ -446,39 +633,19 @@ pub fn jni_refine_search(
     .or_throw(&mut env)
 }
 
-#[jni_method(70, "moe/fuqiuluo/mamu/driver/SearchEngine", "nativeSetProgressBuffer", "(Ljava/nio/ByteBuffer;)Z")]
+/// Legacy method for backward compatibility. Use nativeSetSharedBuffer instead.
+#[jni_method(
+    70,
+    "moe/fuqiuluo/mamu/driver/SearchEngine",
+    "nativeSetProgressBuffer",
+    "(Ljava/nio/ByteBuffer;)Z"
+)]
 pub fn jni_set_progress_buffer(mut env: JNIEnv, _class: JObject, buffer: JObject) -> jboolean {
-    (|| -> JniResult<jboolean> {
-        // 获取DirectByteBuffer的原始指针
-        let buffer = (&buffer).into();
-        let ptr = env.get_direct_buffer_address(buffer)?;
-        let capacity = env.get_direct_buffer_capacity(buffer)?;
-
-        if capacity < 20 {
-            return Err(anyhow!("Buffer too small, need at least 20 bytes"));
-        }
-
-        let mut manager = SEARCH_ENGINE_MANAGER
-            .write()
-            .map_err(|_| anyhow!("Failed to acquire SearchEngineManager write lock"))?;
-
-        manager.set_progress_buffer(ptr, capacity);
-
-        Ok(JNI_TRUE)
-    })()
-    .or_throw(&mut env)
+    jni_set_shared_buffer(env, _class, buffer)
 }
 
+/// Legacy method for backward compatibility. Use nativeClearSharedBuffer instead.
 #[jni_method(70, "moe/fuqiuluo/mamu/driver/SearchEngine", "nativeClearProgressBuffer", "()V")]
 pub fn jni_clear_progress_buffer(mut env: JNIEnv, _class: JObject) {
-    (|| -> JniResult<()> {
-        let mut manager = SEARCH_ENGINE_MANAGER
-            .write()
-            .map_err(|_| anyhow!("Failed to acquire SearchEngineManager write lock"))?;
-
-        manager.clear_progress_buffer();
-
-        Ok(())
-    })()
-    .or_throw(&mut env)
+    jni_clear_shared_buffer(env, _class)
 }

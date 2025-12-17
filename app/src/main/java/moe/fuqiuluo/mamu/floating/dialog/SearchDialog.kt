@@ -16,12 +16,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import moe.fuqiuluo.mamu.R
 import moe.fuqiuluo.mamu.databinding.DialogSearchInputBinding
 import moe.fuqiuluo.mamu.driver.SearchEngine
-import moe.fuqiuluo.mamu.driver.SearchProgressCallback
 import moe.fuqiuluo.mamu.driver.WuwaDriver
 import moe.fuqiuluo.mamu.data.settings.floatingOpacity
 import moe.fuqiuluo.mamu.data.settings.keyboardType
@@ -47,51 +44,126 @@ class SearchDialog(
     private val notification: NotificationOverlay,
     private val searchDialogState: SearchDialogState,
     private val clipboardManager: ClipboardManager,
-    private val onSearchCompleted: ((ranges: List<DisplayMemRegionEntry>) -> Unit)? = null,
-    private val onRefineCompleted: (() -> Unit)? = null
+    private val onSearchCompleted: ((ranges: List<DisplayMemRegionEntry>, totalFound: Long) -> Unit)? = null,
+    private val onRefineCompleted: ((totalFound: Long) -> Unit)? = null
 ) : BaseDialog(context) {
     private val searchScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private lateinit var searchRanges: List<DisplayMemRegionEntry>
 
     // 进度相关
     private var progressDialog: SearchProgressDialog? = null
-    private var progressBuffer: ByteBuffer? = null
 
     // 搜索状态标志
     var isSearching = false
     private var currentIsRefineSearch = false
 
+    // 搜索开始时间
+    private var searchStartTime = 0L
+
     // 退出全屏回调（用于隐藏按钮点击）
     var onExitFullscreen: (() -> Unit)? = null
 
-
     /**
-     * 读取进度buffer中的数据
+     * 读取进度数据从共享缓冲区
      */
     private fun readProgressData(): SearchProgressData {
-        val buffer = progressBuffer ?: return SearchProgressData(0, 0, 0, 0)
-
-        buffer.position(0)
-        val progress = buffer.int
-        val regionsSearched = buffer.int
-        val totalFound = buffer.long
-        val heartbeat = buffer.int
-
-        return SearchProgressData(progress, regionsSearched, totalFound, heartbeat)
+        return SearchProgressData(
+            currentProgress = SearchEngine.getProgress(),
+            regionsOrAddrsSearched = SearchEngine.getRegionsDone(),
+            totalFound = SearchEngine.getFoundCount(),
+            heartbeat = SearchEngine.getHeartbeat()
+        )
     }
 
     /**
-     * 启动进度监控协程
+     * 启动进度监控协程（轮询检查状态）
      */
-    private fun startProgressMonitoring() {
+    private fun startProgressMonitoring(isRefineSearch: Boolean) {
         searchScope.launch(Dispatchers.Main) {
-            while (isActive) {
+            while (isActive && isSearching) {
+                val status = SearchEngine.getStatus()
                 val data = readProgressData()
+
+                // 更新进度 UI
                 progressDialog?.updateProgress(data)
 
-                // 每 100ms 更新一次进度
+                // 检查搜索状态
+                when (status) {
+                    SearchEngine.Status.COMPLETED -> {
+                        val elapsed = System.currentTimeMillis() - searchStartTime
+                        onSearchFinished(isRefineSearch, data.totalFound, elapsed)
+                        break
+                    }
+                    SearchEngine.Status.CANCELLED -> {
+                        onSearchCancelled()
+                        break
+                    }
+                    SearchEngine.Status.ERROR -> {
+                        onSearchError(SearchEngine.getErrorCode())
+                        break
+                    }
+                }
+
                 delay(100)
             }
+        }
+    }
+
+    /**
+     * 搜索完成回调
+     */
+    private fun onSearchFinished(isRefineSearch: Boolean, totalFound: Long, elapsedMillis: Long) {
+        cleanupProgressTracking()
+
+        notification.showSuccess(
+            context.getString(
+                R.string.success_search_complete,
+                totalFound,
+                formatElapsedTime(elapsedMillis)
+            )
+        )
+
+        if (isRefineSearch) {
+            onRefineCompleted?.invoke(totalFound)
+        } else {
+            if (::searchRanges.isInitialized) {
+                onSearchCompleted?.invoke(searchRanges, totalFound)
+            }
+        }
+    }
+
+    /**
+     * 搜索取消回调
+     */
+    private fun onSearchCancelled() {
+        cleanupProgressTracking()
+        notification.showWarning(context.getString(R.string.search_cancelled))
+    }
+
+    /**
+     * 搜索错误回调
+     */
+    private fun onSearchError(errorCode: Int) {
+        cleanupProgressTracking()
+        val errorMessage = when (errorCode) {
+            SearchEngine.ErrorCode.NOT_INITIALIZED -> "搜索引擎未初始化"
+            SearchEngine.ErrorCode.INVALID_QUERY -> "无效的搜索表达式"
+            SearchEngine.ErrorCode.MEMORY_READ_FAILED -> "内存读取失败"
+            SearchEngine.ErrorCode.ALREADY_SEARCHING -> "搜索正在进行中"
+            else -> "搜索出错 (code: $errorCode)"
+        }
+        notification.showError(errorMessage)
+    }
+
+    /**
+     * 取消当前搜索
+     */
+    private fun cancelSearch() {
+        if (isSearching) {
+            // 通过共享内存请求取消（零延迟）
+            SearchEngine.requestCancelViaBuffer()
+            // 也通过 CancellationToken 请求取消
+            SearchEngine.requestCancel()
         }
     }
 
@@ -99,24 +171,18 @@ class SearchDialog(
      * 初始化进度追踪
      */
     private fun setupProgressTracking(isRefineSearch: Boolean) {
-        // 更新搜索状态
         isSearching = true
         currentIsRefineSearch = isRefineSearch
-
-        // 创建 20 字节的 DirectByteBuffer
-        progressBuffer = ByteBuffer.allocateDirect(20).apply {
-            order(ByteOrder.nativeOrder())
-        }
-
-        // 设置到 native 层
-        SearchEngine.setProgressBuffer(progressBuffer!!)
+        searchStartTime = System.currentTimeMillis()
 
         // 显示进度对话框
         progressDialog = SearchProgressDialog(
             context = context,
             isRefineSearch = isRefineSearch,
+            onCancelClick = {
+                cancelSearch()
+            },
             onHideClick = {
-                // 隐藏按钮点击：退出全屏但保持搜索状态
                 onExitFullscreen?.invoke()
             }
         ).apply {
@@ -124,7 +190,7 @@ class SearchDialog(
         }
 
         // 启动进度监控
-        startProgressMonitoring()
+        startProgressMonitoring(isRefineSearch)
     }
 
     /**
@@ -133,61 +199,7 @@ class SearchDialog(
     private fun cleanupProgressTracking() {
         progressDialog?.dismiss()
         progressDialog = null
-
-        SearchEngine.clearProgressBuffer()
-        progressBuffer = null
-
-        // 更新搜索状态
         isSearching = false
-    }
-
-    private inner class SearchCallback : SearchProgressCallback {
-        override fun onSearchComplete(
-            totalFound: Long,
-            totalRegions: Int,
-            elapsedMillis: Long
-        ) {
-            searchScope.launch(Dispatchers.Main) {
-                // 清理进度追踪
-                cleanupProgressTracking()
-
-                if (!::searchRanges.isInitialized) {
-                    notification.showError(context.getString(R.string.error_search_failed_unknown))
-                    return@launch
-                } else {
-                    notification.showSuccess(
-                        context.getString(
-                            R.string.success_search_complete,
-                            totalFound,
-                            formatElapsedTime(elapsedMillis)
-                        )
-                    )
-                    onSearchCompleted?.invoke(searchRanges)
-                }
-            }
-        }
-    }
-
-    private inner class RefineSearchCallback : SearchProgressCallback {
-        override fun onSearchComplete(
-            totalFound: Long,
-            totalRegions: Int,
-            elapsedMillis: Long
-        ) {
-            searchScope.launch(Dispatchers.Main) {
-                // 清理进度追踪
-                cleanupProgressTracking()
-
-                notification.showSuccess(
-                    context.getString(
-                        R.string.success_search_complete,
-                        totalFound,
-                        formatElapsedTime(elapsedMillis)
-                    )
-                )
-                onRefineCompleted?.invoke()
-            }
-        }
     }
 
     fun release() {
@@ -197,31 +209,28 @@ class SearchDialog(
 
     /**
      * 隐藏进度对话框（但保持搜索状态）
-     * 用于退出全屏时隐藏 UI，但后台搜索继续
      */
     fun hideProgressDialog() {
         progressDialog?.dismiss()
         progressDialog = null
-        // 注意：不清理 progressBuffer 和进度监控协程，让搜索继续
     }
 
     /**
      * 如果正在搜索，重新显示进度对话框
-     * 用于重新进入全屏时恢复 UI 显示
      */
     fun showProgressDialogIfSearching() {
         if (isSearching && progressDialog == null) {
-            // 重新创建并显示 SearchProgressDialog
             progressDialog = SearchProgressDialog(
                 context = context,
                 isRefineSearch = currentIsRefineSearch,
+                onCancelClick = {
+                    cancelSearch()
+                },
                 onHideClick = {
-                    // 隐藏按钮点击：退出全屏但保持搜索状态
                     onExitFullscreen?.invoke()
                 }
             ).apply {
                 show()
-                // 同步当前进度
                 updateProgress(readProgressData())
             }
         }
@@ -229,11 +238,9 @@ class SearchDialog(
 
     @SuppressLint("ClickableViewAccessibility", "SetTextI18n")
     override fun setupDialog() {
-        // 使用 dialog.context 确保使用正确的主题
         val binding = DialogSearchInputBinding.inflate(LayoutInflater.from(dialog.context))
         dialog.setContentView(binding.root)
 
-        // 应用透明度设置
         val mmkv = MMKV.defaultMMKV()
         val opacity = mmkv.floatingOpacity
         binding.rootContainer.background?.alpha = (max(opacity, 0.85f) * 255).toInt()
@@ -242,15 +249,12 @@ class SearchDialog(
             context.resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
         binding.builtinKeyboard.setScreenOrientation(isPortrait)
 
-        // 根据配置决定是否禁用系统输入法
         val useBuiltinKeyboard = mmkv.keyboardType == 0
         if (useBuiltinKeyboard) {
-            // 使用内置键盘时，禁用系统输入法弹出
             binding.inputValue.showSoftInputOnFocus = false
             binding.builtinKeyboard.visibility = View.VISIBLE
             binding.divider.visibility = View.VISIBLE
         } else {
-            // 使用系统键盘时，允许系统输入法弹出
             binding.inputValue.showSoftInputOnFocus = true
             binding.builtinKeyboard.visibility = View.GONE
             binding.divider.visibility = View.GONE
@@ -284,9 +288,7 @@ class SearchDialog(
             binding.subtitleRange.text = type.rangeDescription
         }
 
-        // 恢复上次输入的值
         binding.inputValue.setText(searchDialogState.lastInputValue)
-
         binding.btnValueType.text = currentValueType.displayName
         updateSubtitleRange(currentValueType)
 
@@ -316,15 +318,10 @@ class SearchDialog(
 
         binding.builtinKeyboard.listener = object : BuiltinKeyboard.KeyboardListener {
             override fun onKeyInput(key: String) {
-                // 直接操作 Editable，避免 setText 带来的竞争条件
                 val editable = binding.inputValue.text ?: return
                 val selectionStart = binding.inputValue.selectionStart
                 val selectionEnd = binding.inputValue.selectionEnd
-
-                // 使用 Editable.replace() 直接替换选中的文本
-                // 如果没有选中文本，selectionStart == selectionEnd，相当于插入
                 editable.replace(selectionStart, selectionEnd, key)
-                // 光标会自动移动到插入文本之后
             }
 
             override fun onDelete() {
@@ -333,10 +330,8 @@ class SearchDialog(
                 val selectionEnd = binding.inputValue.selectionEnd
 
                 if (selectionStart != selectionEnd) {
-                    // 有选中文本，删除选中部分
                     editable.delete(selectionStart, selectionEnd)
                 } else if (selectionStart > 0) {
-                    // 无选中文本，删除光标前一个字符
                     editable.delete(selectionStart - 1, selectionStart)
                 }
             }
@@ -370,32 +365,26 @@ class SearchDialog(
                     val editable = binding.inputValue.text ?: return
                     val selectionStart = binding.inputValue.selectionStart
                     val selectionEnd = binding.inputValue.selectionEnd
-
-                    // 使用 Editable.replace() 在光标位置粘贴文本
                     editable.replace(selectionStart, selectionEnd, text)
                 }
             }
         }
 
-        // 检查是否有搜索结果，动态设置按钮布局
         val hasResults = SearchEngine.getTotalResultCount() > 0
 
         if (hasResults) {
-            // 有结果时：[新搜索] [取消] [改善]
-            binding.btnNewSearch?.visibility = View.VISIBLE
-            binding.buttonSpacer?.visibility = View.VISIBLE
+            binding.btnNewSearch.visibility = View.VISIBLE
+            binding.buttonSpacer.visibility = View.VISIBLE
             binding.btnConfirm.visibility = View.GONE
-            binding.btnRefine?.visibility = View.VISIBLE
+            binding.btnRefine.visibility = View.VISIBLE
         } else {
-            // 无结果时：[取消] [搜索]
-            binding.btnNewSearch?.visibility = View.GONE
-            binding.buttonSpacer?.visibility = View.GONE
+            binding.btnNewSearch.visibility = View.GONE
+            binding.buttonSpacer.visibility = View.GONE
             binding.btnConfirm.visibility = View.VISIBLE
-            binding.btnRefine?.visibility = View.GONE
+            binding.btnRefine.visibility = View.GONE
         }
 
-        // 执行搜索的通用函数
-        val preCheck: (String) -> Boolean = preCheck@ { expression ->
+        val preCheck: (String) -> Boolean = preCheck@{ expression ->
             if (expression.isEmpty()) {
                 notification.showError(context.getString(R.string.error_empty_search_value))
                 return@preCheck false
@@ -406,6 +395,8 @@ class SearchDialog(
 
             return@preCheck true
         }
+
+        // 执行异步搜索
         val performSearch: () -> Unit = performSearch@{
             val expression = binding.inputValue.text.toString().trim()
             val valueType = currentValueType
@@ -415,11 +406,6 @@ class SearchDialog(
             }
 
             searchScope.launch {
-                // 先在主线程初始化进度追踪
-                withContext(Dispatchers.Main) {
-                    setupProgressTracking(false)
-                }
-
                 SearchEngine.clearSearchResults()
                 val ranges = mmkv.selectedMemoryRanges
 
@@ -436,24 +422,37 @@ class SearchDialog(
                     }
 
                 runCatching {
-                    // 普通搜索：在指定内存区域中搜索
-                    SearchEngine.exactSearchWithCustomRange(
+                    // 使用异步 API 启动搜索
+                    // IMPORTANT: Start search FIRST, then start monitoring
+                    // This ensures the monitoring coroutine sees SEARCHING status, not old COMPLETED
+                    val started = SearchEngine.startSearchAsyncWithCustomRange(
                         expression,
                         valueType,
                         nativeRegions.toLongArray(),
-                        useDeepSearch = binding.cbIsDeeplySearch.isChecked,
-                        SearchCallback()
+                        useDeepSearch = binding.cbIsDeeplySearch.isChecked
                     )
+                    if (started) {
+                        // Start monitoring AFTER search has started (status is now SEARCHING)
+                        withContext(Dispatchers.Main) {
+                            setupProgressTracking(false)
+                        }
+                    } else {
+                        withContext(Dispatchers.Main) {
+                            notification.showError("启动搜索失败")
+                        }
+                    }
                 }.onFailure {
                     Log.e(TAG, "搜索失败", it)
-                    // 搜索失败也要清理进度追踪
                     withContext(Dispatchers.Main) {
                         cleanupProgressTracking()
+                        notification.showError("搜索失败: ${it.message}")
                     }
                 }
             }
         }
-        val refineSearch: () -> Unit = refineSearch@ {
+
+        // 执行异步改善搜索
+        val refineSearch: () -> Unit = refineSearch@{
             val expression = binding.inputValue.text.toString().trim()
             val valueType = currentValueType
 
@@ -462,23 +461,24 @@ class SearchDialog(
             }
 
             searchScope.launch {
-                // 先在主线程初始化进度追踪
-                withContext(Dispatchers.Main) {
-                    setupProgressTracking(true)
-                }
-
                 runCatching {
-                    // 改善搜索：基于上一次搜索结果进行再次搜索
-                    SearchEngine.refineSearch(
-                        expression,
-                        valueType,
-                        RefineSearchCallback()
-                    )
+                    // IMPORTANT: Start search FIRST, then start monitoring
+                    val started = SearchEngine.startRefineAsync(expression, valueType)
+                    if (started) {
+                        // Start monitoring AFTER search has started (status is now SEARCHING)
+                        withContext(Dispatchers.Main) {
+                            setupProgressTracking(true)
+                        }
+                    } else {
+                        withContext(Dispatchers.Main) {
+                            notification.showError("启动改善搜索失败")
+                        }
+                    }
                 }.onFailure {
                     Log.e(TAG, "改善搜索失败", it)
-                    // 搜索失败也要清理进度追踪
                     withContext(Dispatchers.Main) {
                         cleanupProgressTracking()
+                        notification.showError("改善搜索失败: ${it.message}")
                     }
                 }
             }
@@ -490,12 +490,10 @@ class SearchDialog(
             dialog.dismiss()
         }
 
-        // 新搜索按钮：清除旧结果并进行全新搜索
-        binding.btnNewSearch?.setOnClickListener {
+        binding.btnNewSearch.setOnClickListener {
             performSearch()
         }
 
-        // 搜索按钮
         binding.btnConfirm.setOnClickListener {
             if (hasResults) {
                 refineSearch()
@@ -504,8 +502,7 @@ class SearchDialog(
             }
         }
 
-        // 改善按钮
-        binding.btnRefine?.setOnClickListener {
+        binding.btnRefine.setOnClickListener {
             refineSearch()
         }
     }

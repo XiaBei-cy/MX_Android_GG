@@ -76,17 +76,17 @@ pub(crate) fn search_region_single(
         current = chunk_end;
     }
 
-    if log_enabled!(Level::Debug) {
-        let region_size = end - start;
-        debug!(
-            "Region stats: size={}MB, reads={} success + {} failed, matches_checked={}, found={}",
-            region_size / 1024 / 1024,
-            read_success,
-            read_failed,
-            matches_checked,
-            results.len()
-        );
-    }
+    // if log_enabled!(Level::Debug) {
+    //     let region_size = end - start;
+    //     debug!(
+    //         "Region stats: size={}MB, reads={} success + {} failed, matches_checked={}, found={}",
+    //         region_size / 1024 / 1024,
+    //         read_success,
+    //         read_failed,
+    //         matches_checked,
+    //         results.len()
+    //     );
+    // }
 
     Ok(results)
 }
@@ -222,6 +222,118 @@ pub(crate) fn refine_single_search(
     if log_enabled!(Level::Debug) {
         debug!(
             "Refine single search: {} -> {} results",
+            filtered_addresses.len(),
+            results.len()
+        );
+    }
+
+    Ok(results)
+}
+
+/// Single value refine search with cancel and progress callbacks.
+/// This version supports cancellation checking and progress updates during the search.
+pub(crate) fn refine_single_search_with_cancel<F, P>(
+    addresses: &[ValuePair],
+    target: &SearchValue,
+    processed_counter: Option<&Arc<AtomicUsize>>,
+    total_found_counter: Option<&Arc<AtomicUsize>>,
+    check_cancelled: &F,
+    update_progress: &P,
+) -> Result<Vec<ValuePair>>
+where
+    F: Fn() -> bool + Sync,
+    P: Fn(usize, usize) + Sync,
+{
+    use rayon::prelude::*;
+    use std::sync::atomic::Ordering;
+
+    if addresses.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Check cancellation before starting.
+    if check_cancelled() {
+        return Ok(Vec::new());
+    }
+
+    let driver_manager = DRIVER_MANAGER
+        .read()
+        .map_err(|_| anyhow!("Failed to acquire DriverManager lock"))?;
+
+    let target_type = target.value_type();
+    let element_size = target_type.size();
+
+    // Filter addresses with non-matching types.
+    let filtered_addresses: Vec<_> = addresses
+        .iter()
+        .filter(|p| p.value_type == target_type)
+        .cloned()
+        .collect();
+
+    if filtered_addresses.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let total_addresses = filtered_addresses.len();
+
+    // Read values for each address sequentially.
+    let mut address_values: Vec<(ValuePair, Vec<u8>)> = Vec::with_capacity(filtered_addresses.len());
+
+    for (idx, pair) in filtered_addresses.iter().enumerate() {
+        // Check cancellation periodically.
+        if idx % 1000 == 0 && check_cancelled() {
+            return Ok(Vec::new());
+        }
+
+        let mut buffer = vec![0u8; element_size];
+        if driver_manager.read_memory_unified(pair.addr, &mut buffer, None).is_ok() {
+            address_values.push((pair.clone(), buffer));
+        }
+
+        // Update processed counter and progress.
+        if let Some(counter) = &processed_counter {
+            let processed = counter.fetch_add(1, Ordering::Relaxed) + 1;
+            // Update progress every 100 addresses.
+            if processed % 100 == 0 {
+                let found = total_found_counter
+                    .map(|c| c.load(Ordering::Relaxed))
+                    .unwrap_or(0);
+                update_progress(processed, found);
+            }
+        }
+    }
+
+    drop(driver_manager);
+
+    // Check cancellation before parallel matching.
+    if check_cancelled() {
+        return Ok(Vec::new());
+    }
+
+    // Use rayon for parallel matching.
+    let results: Vec<ValuePair> = address_values
+        .into_par_iter()
+        .filter_map(|(pair, bytes)| {
+            if let Ok(true) = target.matched(&bytes) {
+                if let Some(counter) = &total_found_counter {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+                Some(pair)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Final progress update.
+    let found_count = total_found_counter
+        .map(|c| c.load(Ordering::Relaxed))
+        .unwrap_or(results.len());
+    update_progress(total_addresses, found_count);
+
+    if log_enabled!(Level::Debug) {
+        debug!(
+            "Refine single search with cancel: {} -> {} results",
             filtered_addresses.len(),
             results.len()
         );

@@ -13,6 +13,7 @@ use nix::libc::close;
 use nix::sys::mman::{MapFlags, ProtFlags, mmap, munmap};
 use obfstr::obfstr as s;
 use std::num::NonZeroUsize;
+use std::os::fd::BorrowedFd;
 
 mod conversions {
     use super::*;
@@ -288,8 +289,6 @@ pub fn jni_query_mem_regions<'l>(
     _obj: JObject,
     pid: jint,
 ) -> JObjectArray<'l> {
-    use std::os::fd::BorrowedFd;
-
     (|| -> JniResult<JObjectArray<'l>> {
         let manager = DRIVER_MANAGER.read()
             .map_err(|_| anyhow!("Failed to acquire DriverManager read lock"))?;
@@ -341,7 +340,6 @@ pub fn jni_query_mem_regions<'l>(
         }
 
         let mem_region_class = env.find_class("moe/fuqiuluo/mamu/driver/MemRegionEntry")?;
-
         let result_array = env.new_object_array(filtered_entries.len() as jsize, &mem_region_class, JObject::null());
 
         let result_array = match result_array {

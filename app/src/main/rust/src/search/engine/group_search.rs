@@ -175,6 +175,27 @@ pub(crate) fn search_region_group_deep(
     end: u64,
     per_chunk_size: usize,
 ) -> Result<BPlusTreeSet<ValuePair>> {
+    // Use a no-op cancel check for backward compatibility.
+    search_region_group_deep_with_cancel(query, start, end, per_chunk_size, &|| false)
+}
+
+/// Deep group search with cancellation support.
+/// The `check_cancelled` closure is called periodically to check if the search should be cancelled.
+pub(crate) fn search_region_group_deep_with_cancel<F>(
+    query: &SearchQuery,
+    start: u64,
+    end: u64,
+    per_chunk_size: usize,
+    check_cancelled: &F,
+) -> Result<BPlusTreeSet<ValuePair>>
+where
+    F: Fn() -> bool,
+{
+    // Check cancellation before starting.
+    if check_cancelled() {
+        return Ok(BPlusTreeSet::new(BPLUS_TREE_ORDER));
+    }
+
     let driver_manager = DRIVER_MANAGER
         .read()
         .map_err(|_| anyhow!("Failed to acquire DriverManager lock"))?;
@@ -193,6 +214,11 @@ pub(crate) fn search_region_group_deep(
     let mut prev_chunk_valid = false;
 
     while current < end {
+        // Check cancellation at each chunk.
+        if check_cancelled() {
+            return Ok(results);
+        }
+
         let chunk_end = (current + per_chunk_size as u64).min(end);
         let chunk_len = (chunk_end - current) as usize;
 
@@ -211,7 +237,7 @@ pub(crate) fn search_region_group_deep(
                     read_success += 1;
 
                     if is_first_chunk {
-                        search_in_buffer_group_deep(
+                        search_in_buffer_group_deep_with_cancel(
                             &sliding_buffer[per_chunk_size..per_chunk_size + chunk_len],
                             current,
                             start,
@@ -221,6 +247,7 @@ pub(crate) fn search_region_group_deep(
                             &page_status,
                             &mut results,
                             &mut matches_checked,
+                            check_cancelled,
                         );
                         is_first_chunk = false;
                     } else if prev_chunk_valid {
@@ -252,7 +279,7 @@ pub(crate) fn search_region_group_deep(
                             }
                         }
 
-                        search_in_buffer_group_deep(
+                        search_in_buffer_group_deep_with_cancel(
                             &sliding_buffer[overlap_start_offset..per_chunk_size + chunk_len],
                             overlap_start_addr,
                             start,
@@ -262,9 +289,10 @@ pub(crate) fn search_region_group_deep(
                             &combined_status,
                             &mut results,
                             &mut matches_checked,
+                            check_cancelled,
                         );
                     } else {
-                        search_in_buffer_group_deep(
+                        search_in_buffer_group_deep_with_cancel(
                             &sliding_buffer[per_chunk_size..per_chunk_size + chunk_len],
                             current,
                             start,
@@ -274,6 +302,7 @@ pub(crate) fn search_region_group_deep(
                             &page_status,
                             &mut results,
                             &mut matches_checked,
+                            check_cancelled,
                         );
                     }
 
@@ -735,6 +764,49 @@ pub(crate) fn search_in_buffer_group_deep(
     }
 }
 
+/// Deep group search with cancellation support.
+pub(crate) fn search_in_buffer_group_deep_with_cancel<F>(
+    buffer: &[u8],
+    buffer_addr: u64,
+    region_start: u64,
+    region_end: u64,
+    min_element_size: usize,
+    query: &SearchQuery,
+    page_status: &PageStatusBitmap,
+    results: &mut BPlusTreeSet<ValuePair>,
+    matches_checked: &mut usize,
+    check_cancelled: &F,
+) where
+    F: Fn() -> bool,
+{
+    match query.mode {
+        SearchMode::Ordered => search_ordered_deep_with_cancel(
+            buffer,
+            buffer_addr,
+            region_start,
+            region_end,
+            min_element_size,
+            query,
+            page_status,
+            results,
+            matches_checked,
+            check_cancelled,
+        ),
+        SearchMode::Unordered => search_unordered_deep_with_cancel(
+            buffer,
+            buffer_addr,
+            region_start,
+            region_end,
+            min_element_size,
+            query,
+            page_status,
+            results,
+            matches_checked,
+            check_cancelled,
+        ),
+    }
+}
+
 /// Deep search for ordered mode using DFS backtracking
 fn search_ordered_deep(
     buffer: &[u8],
@@ -1027,6 +1099,391 @@ fn dfs_unordered(
     }
 }
 
+/// Deep search for ordered mode with cancellation support.
+fn search_ordered_deep_with_cancel<F>(
+    buffer: &[u8],
+    buffer_addr: u64,
+    region_start: u64,
+    region_end: u64,
+    min_element_size: usize,
+    query: &SearchQuery,
+    page_status: &PageStatusBitmap,
+    results: &mut BPlusTreeSet<ValuePair>,
+    matches_checked: &mut usize,
+    check_cancelled: &F,
+) where
+    F: Fn() -> bool,
+{
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let buffer_end = buffer_addr + buffer.len() as u64;
+    let search_start = buffer_addr.max(region_start);
+    let search_end = buffer_end.min(region_end);
+
+    let rem = search_start % min_element_size as u64;
+    let first_addr = if rem == 0 {
+        search_start
+    } else {
+        search_start + min_element_size as u64 - rem
+    };
+
+    let page_ranges = page_status.get_success_page_ranges();
+    if page_ranges.is_empty() {
+        return;
+    }
+
+    let buffer_page_start = buffer_addr & *PAGE_MASK as u64;
+    let search_range = query.range as u64;
+
+    // Use AtomicBool to propagate cancellation from DFS.
+    let cancelled = AtomicBool::new(false);
+
+    for (start_page, end_page) in page_ranges {
+        // Check cancellation at page range level.
+        if check_cancelled() || cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let page_range_start = buffer_page_start + (start_page * *PAGE_SIZE) as u64;
+        let page_range_end = buffer_page_start + (end_page * *PAGE_SIZE) as u64;
+
+        let range_start = page_range_start.max(buffer_addr);
+        let range_end = page_range_end.min(search_end).min(buffer_end);
+
+        if range_start >= range_end {
+            continue;
+        }
+
+        let mut addr = if range_start <= first_addr {
+            first_addr
+        } else {
+            let rem = range_start % min_element_size as u64;
+            if rem == 0 {
+                range_start
+            } else {
+                range_start + min_element_size as u64 - rem
+            }
+        };
+
+        let mut iteration_count = 0u64;
+        while addr < range_end {
+            // Check cancellation periodically (every 1000 iterations).
+            iteration_count += 1;
+            if iteration_count % 1000 == 0 && check_cancelled() {
+                cancelled.store(true, Ordering::Relaxed);
+                return;
+            }
+
+            let offset = (addr - buffer_addr) as usize;
+            if offset < buffer.len() {
+                let range_end_check = (addr + search_range).min(buffer_end).min(search_end);
+                let range_size = (range_end_check - addr) as usize;
+
+                if range_size >= query.range as usize && offset + range_size <= buffer.len() {
+                    *matches_checked += 1;
+
+                    let mut chosen = Vec::with_capacity(query.values.len());
+                    let mut used = HashSet::new();
+
+                    dfs_ordered_with_cancel(
+                        &buffer[offset..offset + range_size],
+                        addr,
+                        0,
+                        0,
+                        query,
+                        &mut chosen,
+                        &mut used,
+                        results,
+                        check_cancelled,
+                        &cancelled,
+                    );
+
+                    if cancelled.load(Ordering::Relaxed) {
+                        return;
+                    }
+                }
+            }
+            addr += min_element_size as u64;
+        }
+    }
+}
+
+/// DFS backtracking for ordered search with cancellation support.
+fn dfs_ordered_with_cancel<F>(
+    buffer: &[u8],
+    base_addr: u64,
+    query_idx: usize,
+    search_offset: usize,
+    query: &SearchQuery,
+    chosen: &mut Vec<(u64, ValueType)>,
+    used: &mut std::collections::HashSet<u64>,
+    results: &mut BPlusTreeSet<ValuePair>,
+    check_cancelled: &F,
+    cancelled: &std::sync::atomic::AtomicBool,
+) where
+    F: Fn() -> bool,
+{
+    use std::sync::atomic::Ordering;
+
+    // Check cancellation flag.
+    if cancelled.load(Ordering::Relaxed) {
+        return;
+    }
+
+    // Found complete match.
+    if query_idx == query.values.len() {
+        for (addr, vt) in chosen.iter() {
+            results.insert(ValuePair::new(*addr, *vt));
+        }
+        return;
+    }
+
+    let target_value = &query.values[query_idx];
+    let value_size = target_value.value_type().size();
+    let alignment = value_size;
+
+    let mut offset = search_offset;
+    let mut iteration_count = 0u64;
+    while offset + value_size <= buffer.len() {
+        // Check cancellation periodically (every 500 iterations in DFS).
+        iteration_count += 1;
+        if iteration_count % 500 == 0 {
+            if check_cancelled() {
+                cancelled.store(true, Ordering::Relaxed);
+                return;
+            }
+        }
+
+        let addr = base_addr + offset as u64;
+
+        if used.contains(&addr) {
+            offset += alignment;
+            continue;
+        }
+
+        let element_bytes = &buffer[offset..offset + value_size];
+        if let Ok(true) = target_value.matched(element_bytes) {
+            chosen.push((addr, target_value.value_type()));
+            used.insert(addr);
+
+            dfs_ordered_with_cancel(
+                buffer,
+                base_addr,
+                query_idx + 1,
+                offset + value_size,
+                query,
+                chosen,
+                used,
+                results,
+                check_cancelled,
+                cancelled,
+            );
+
+            // Check if we should stop.
+            if cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+
+            chosen.pop();
+            used.remove(&addr);
+        }
+
+        offset += alignment;
+    }
+}
+
+/// Deep search for unordered mode with cancellation support.
+fn search_unordered_deep_with_cancel<F>(
+    buffer: &[u8],
+    buffer_addr: u64,
+    region_start: u64,
+    region_end: u64,
+    min_element_size: usize,
+    query: &SearchQuery,
+    page_status: &PageStatusBitmap,
+    results: &mut BPlusTreeSet<ValuePair>,
+    matches_checked: &mut usize,
+    check_cancelled: &F,
+) where
+    F: Fn() -> bool,
+{
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let buffer_end = buffer_addr + buffer.len() as u64;
+    let search_start = buffer_addr.max(region_start);
+    let search_end = buffer_end.min(region_end);
+
+    let rem = search_start % min_element_size as u64;
+    let first_addr = if rem == 0 {
+        search_start
+    } else {
+        search_start + min_element_size as u64 - rem
+    };
+
+    let page_ranges = page_status.get_success_page_ranges();
+    if page_ranges.is_empty() {
+        return;
+    }
+
+    let buffer_page_start = buffer_addr & *PAGE_MASK as u64;
+    let search_range = query.range as u64;
+
+    let cancelled = AtomicBool::new(false);
+
+    for (start_page, end_page) in page_ranges {
+        // Check cancellation at page range level.
+        if check_cancelled() || cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let page_range_start = buffer_page_start + (start_page * *PAGE_SIZE) as u64;
+        let page_range_end = buffer_page_start + (end_page * *PAGE_SIZE) as u64;
+
+        let range_start = page_range_start.max(buffer_addr);
+        let range_end = page_range_end.min(search_end).min(buffer_end);
+
+        if range_start >= range_end {
+            continue;
+        }
+
+        let mut addr = if range_start <= first_addr {
+            first_addr
+        } else {
+            let rem = range_start % min_element_size as u64;
+            if rem == 0 {
+                range_start
+            } else {
+                range_start + min_element_size as u64 - rem
+            }
+        };
+
+        let mut iteration_count = 0u64;
+        while addr < range_end {
+            // Check cancellation periodically.
+            iteration_count += 1;
+            if iteration_count % 1000 == 0 && check_cancelled() {
+                cancelled.store(true, Ordering::Relaxed);
+                return;
+            }
+
+            let offset = (addr - buffer_addr) as usize;
+            if offset < buffer.len() {
+                let unordered_start = addr.saturating_sub(search_range).max(buffer_addr);
+                let unordered_end = (addr + search_range).min(buffer_end).min(search_end);
+                let start_offset = (unordered_start - buffer_addr) as usize;
+                let range_size = (unordered_end - unordered_start) as usize;
+
+                if range_size >= query.range as usize && start_offset + range_size <= buffer.len() {
+                    *matches_checked += 1;
+
+                    let mut chosen = Vec::with_capacity(query.values.len());
+                    let mut used = HashSet::new();
+
+                    dfs_unordered_with_cancel(
+                        &buffer[start_offset..start_offset + range_size],
+                        unordered_start,
+                        0,
+                        0,
+                        query,
+                        &mut chosen,
+                        &mut used,
+                        results,
+                        check_cancelled,
+                        &cancelled,
+                    );
+
+                    if cancelled.load(Ordering::Relaxed) {
+                        return;
+                    }
+                }
+            }
+            addr += min_element_size as u64;
+        }
+    }
+}
+
+/// DFS backtracking for unordered search with cancellation support.
+fn dfs_unordered_with_cancel<F>(
+    buffer: &[u8],
+    base_addr: u64,
+    query_idx: usize,
+    search_offset: usize,
+    query: &SearchQuery,
+    chosen: &mut Vec<(u64, ValueType)>,
+    used: &mut std::collections::HashSet<u64>,
+    results: &mut BPlusTreeSet<ValuePair>,
+    check_cancelled: &F,
+    cancelled: &std::sync::atomic::AtomicBool,
+) where
+    F: Fn() -> bool,
+{
+    use std::sync::atomic::Ordering;
+
+    if cancelled.load(Ordering::Relaxed) {
+        return;
+    }
+
+    if query_idx == query.values.len() {
+        for (addr, vt) in chosen.iter() {
+            results.insert(ValuePair::new(*addr, *vt));
+        }
+        return;
+    }
+
+    let target_value = &query.values[query_idx];
+    let value_size = target_value.value_type().size();
+    let alignment = value_size;
+
+    let mut offset = search_offset;
+    let mut iteration_count = 0u64;
+    while offset + value_size <= buffer.len() {
+        iteration_count += 1;
+        if iteration_count % 500 == 0 {
+            if check_cancelled() {
+                cancelled.store(true, Ordering::Relaxed);
+                return;
+            }
+        }
+
+        let addr = base_addr + offset as u64;
+
+        if used.contains(&addr) {
+            offset += alignment;
+            continue;
+        }
+
+        let element_bytes = &buffer[offset..offset + value_size];
+        if let Ok(true) = target_value.matched(element_bytes) {
+            chosen.push((addr, target_value.value_type()));
+            used.insert(addr);
+
+            dfs_unordered_with_cancel(
+                buffer,
+                base_addr,
+                query_idx + 1,
+                offset + alignment,
+                query,
+                chosen,
+                used,
+                results,
+                check_cancelled,
+                cancelled,
+            );
+
+            if cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+
+            chosen.pop();
+            used.remove(&addr);
+        }
+
+        offset += alignment;
+    }
+}
+
 // ==================== Refine Search (Result Improvement) ====================
 
 /// 使用 DFS 算法对已有搜索结果进行组搜索改善
@@ -1245,6 +1702,241 @@ pub(crate) fn refine_search_group_with_dfs(
             counter.store(refined_results.len(), Ordering::Relaxed);
         }
     }
+
+    Ok(refined_results)
+}
+
+/// Group refine search with DFS algorithm, with cancel and progress callbacks.
+/// This version supports cancellation checking and progress updates during the search.
+pub(crate) fn refine_search_group_with_dfs_and_cancel<F, P>(
+    existing_results: &Vec<ValuePair>,
+    query: &SearchQuery,
+    processed_counter: Option<&Arc<AtomicUsize>>,
+    total_found_counter: Option<&Arc<AtomicUsize>>,
+    check_cancelled: &F,
+    update_progress: &P,
+) -> Result<BPlusTreeSet<ValuePair>>
+where
+    F: Fn() -> bool + Sync,
+    P: Fn(usize, usize) + Sync,
+{
+    use rayon::prelude::*;
+    use std::collections::HashSet;
+    use std::sync::atomic::Ordering;
+
+    if log_enabled!(Level::Debug) {
+        debug!("Group refine with cancel - result count: {}", existing_results.len())
+    }
+
+    // Check cancellation before starting.
+    if check_cancelled() {
+        return Ok(BPlusTreeSet::new(BPLUS_TREE_ORDER));
+    }
+
+    let driver_manager = DRIVER_MANAGER
+        .read()
+        .map_err(|_| anyhow!("Failed to acquire DriverManager lock"))?;
+
+    let mut refined_results = BPlusTreeSet::new(BPLUS_TREE_ORDER);
+
+    if query.values.is_empty() {
+        return Ok(refined_results);
+    }
+
+    // Read all address values.
+    let mut addr_values: Vec<(u64, Vec<u8>)> = Vec::with_capacity(existing_results.len());
+    for (idx, pair) in existing_results.iter().enumerate() {
+        // Check cancellation periodically.
+        if idx % 1000 == 0 && check_cancelled() {
+            return Ok(BPlusTreeSet::new(BPLUS_TREE_ORDER));
+        }
+
+        let addr = pair.addr;
+        let value_size = pair.value_type.size();
+        let mut buffer = vec![0u8; value_size];
+
+        if driver_manager.read_memory_unified(addr, &mut buffer, None).is_ok() {
+            addr_values.push((addr, buffer));
+        } else {
+            if let Some(counter) = processed_counter {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+            if log_enabled!(Level::Debug) {
+                warn!("Failed to read memory during refine search, addr: {:x}, size = {}", addr, value_size)
+            }
+        }
+    }
+
+    if addr_values.is_empty() {
+        if log_enabled!(Level::Debug) {
+            debug!("Result count: {}, but all reads failed", existing_results.len())
+        }
+        return Ok(refined_results);
+    }
+
+    if log_enabled!(Level::Debug) {
+        debug!("Result count: {}, readable addresses: {}", existing_results.len(), addr_values.len());
+    }
+
+    // Check cancellation.
+    if check_cancelled() {
+        return Ok(BPlusTreeSet::new(BPLUS_TREE_ORDER));
+    }
+
+    // Find all anchor points.
+    let first_query_target = &query.values[0];
+    let anchors: Vec<u64> = addr_values
+        .par_iter()
+        .filter_map(|(addr, bytes)| {
+            if let Ok(true) = first_query_target.matched(&bytes) {
+                Some(*addr)
+            } else {
+                if let Some(counter) = &processed_counter {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+                None
+            }
+        })
+        .collect();
+
+    if log_enabled!(Level::Debug) {
+        debug!("Anchor count: {}, readable addresses: {}", anchors.len(), addr_values.len());
+    }
+
+    if anchors.is_empty() {
+        return Ok(refined_results);
+    }
+
+    if query.values.len() == 1 {
+        // Single value refine, return anchor results directly.
+        let value_type = query.values[0].value_type();
+        for anchor_addr in anchors {
+            refined_results.insert(ValuePair::new(anchor_addr, value_type));
+        }
+        return Ok(refined_results);
+    }
+
+    let total_anchors = anchors.len();
+
+    // Main loop: DFS for each anchor.
+    for (anchor_idx, anchor_addr) in anchors.iter().enumerate() {
+        // Check cancellation periodically.
+        if anchor_idx % 100 == 0 && check_cancelled() {
+            return Ok(refined_results);
+        }
+
+        let (min_addr, max_addr) = match query.mode {
+            SearchMode::Unordered => (
+                anchor_addr.saturating_sub(query.range as u64),
+                anchor_addr + query.range as u64,
+            ),
+            SearchMode::Ordered => (*anchor_addr, anchor_addr + query.range as u64),
+        };
+
+        // Candidates (excluding anchor itself to avoid duplicate usage).
+        let mut candidates: Vec<(u64, &Vec<u8>)> = Vec::new();
+        for (addr, bytes) in &addr_values {
+            if *addr >= min_addr && *addr <= max_addr && *addr != *anchor_addr {
+                candidates.push((*addr, bytes));
+            }
+        }
+
+        // Pruning: if candidate count < (query.values.len() - 1), cannot succeed.
+        if candidates.len() < query.values.len() - 1 {
+            if let Some(counter) = &processed_counter {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+            continue;
+        }
+
+        // DFS: find all valid combinations.
+        let mut used: HashSet<u64> = HashSet::new();
+        used.insert(*anchor_addr);
+
+        let mut chosen: Vec<(u64, ValueType)> = Vec::with_capacity(query.values.len());
+        chosen.push((*anchor_addr, query.values[0].value_type()));
+
+        // Inner DFS function.
+        fn dfs(
+            cand_idx: usize,
+            candidates: &[(u64, &Vec<u8>)],
+            query: &SearchQuery,
+            chosen: &mut Vec<(u64, ValueType)>,
+            used: &mut HashSet<u64>,
+            refined_results: &mut BPlusTreeSet<ValuePair>,
+        ) -> Result<()> {
+            let need_total = query.values.len();
+            let have = chosen.len();
+
+            if have == need_total {
+                for (addr, vt) in chosen.iter() {
+                    refined_results.insert(ValuePair::new(*addr, *vt));
+                }
+                return Ok(());
+            }
+
+            let remaining_need = need_total - have;
+            let remaining_candidates = candidates.len().saturating_sub(cand_idx);
+            if remaining_candidates < remaining_need {
+                return Ok(());
+            }
+
+            let sv = &query.values[have];
+
+            for i in cand_idx..candidates.len() {
+                let (addr, bytes) = candidates[i];
+
+                if sv.value_type().size() > bytes.len() {
+                    continue;
+                }
+
+                if !sv.matched(bytes).unwrap_or(false) {
+                    continue;
+                }
+
+                if used.contains(&addr) {
+                    continue;
+                }
+
+                used.insert(addr);
+                chosen.push((addr, sv.value_type()));
+
+                dfs(i + 1, candidates, query, chosen, used, refined_results)?;
+
+                chosen.pop();
+                used.remove(&addr);
+            }
+
+            Ok(())
+        }
+
+        dfs(0, &candidates, query, &mut chosen, &mut used, &mut refined_results)?;
+
+        // Update processed counter and progress.
+        if let Some(counter) = &processed_counter {
+            let processed = counter.fetch_add(1, Ordering::Relaxed) + 1;
+            if log_enabled!(Level::Debug) {
+                debug!("DFS done, processed addresses: {}", processed);
+            }
+            // Update progress every 10 anchors.
+            if processed % 10 == 0 {
+                let found = total_found_counter
+                    .map(|c| c.load(Ordering::Relaxed))
+                    .unwrap_or(refined_results.len());
+                update_progress(processed, found);
+            }
+        }
+
+        if let Some(counter) = &total_found_counter {
+            counter.store(refined_results.len(), Ordering::Relaxed);
+        }
+    }
+
+    // Final progress update.
+    let found_count = total_found_counter
+        .map(|c| c.load(Ordering::Relaxed))
+        .unwrap_or(refined_results.len());
+    update_progress(total_anchors, found_count);
 
     Ok(refined_results)
 }

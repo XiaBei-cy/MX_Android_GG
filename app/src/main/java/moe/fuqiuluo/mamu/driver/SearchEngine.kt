@@ -2,39 +2,226 @@
 
 package moe.fuqiuluo.mamu.driver
 
+import android.util.Log
 import moe.fuqiuluo.mamu.floating.ext.divideToSimpleMemoryRange
 import moe.fuqiuluo.mamu.floating.data.model.DisplayValueType
 import moe.fuqiuluo.mamu.floating.data.model.MemoryRange
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
+
+private const val TAG = "SearchEngine"
 
 object SearchEngine {
     /**
-     * 初始化搜索引擎
-     * @param bufferSize 搜索缓冲区大小，单位字节 （缓存搜索结果）
-     * @param cacheFileDir 缓存文件目录
-     * @param chunkSize 分块大小，单位字节，默认512KB
-     * @return 初始化是否成功
+     * Shared buffer size in bytes.
+     * Memory layout:
+     * [0-3]   status         (Rust writes)  SearchStatus enum
+     * [4-7]   progress       (Rust writes)  0-100
+     * [8-11]  regions_done   (Rust writes)  completed region count
+     * [12-19] found_count    (Rust writes)  total results found (i64)
+     * [20-23] heartbeat      (Rust writes)  periodic random value
+     * [24-27] cancel_flag    (Kotlin writes) 1 = cancel requested
+     * [28-31] error_code     (Rust writes)  error code when status is Error
+     */
+    const val SHARED_BUFFER_SIZE = 32
+
+    /** Search status constants. */
+    object Status {
+        const val IDLE = 0
+        const val SEARCHING = 1
+        const val COMPLETED = 2
+        const val CANCELLED = 3
+        const val ERROR = 4
+    }
+
+    /** Error code constants. */
+    object ErrorCode {
+        const val NONE = 0
+        const val NOT_INITIALIZED = 1
+        const val INVALID_QUERY = 2
+        const val MEMORY_READ_FAILED = 3
+        const val INTERNAL_ERROR = 4
+        const val ALREADY_SEARCHING = 5
+    }
+
+    /** Shared buffer offsets. */
+    private object Offset {
+        const val STATUS = 0
+        const val PROGRESS = 4
+        const val REGIONS_DONE = 8
+        const val FOUND_COUNT = 12
+        const val HEARTBEAT = 20
+        const val CANCEL_FLAG = 24
+        const val ERROR_CODE = 28
+    }
+
+    private var sharedBuffer: ByteBuffer? = null
+
+    /**
+     * Initializes the search engine.
+     * @param bufferSize Search buffer size in bytes (for caching search results).
+     * @param cacheFileDir Cache file directory.
+     * @param chunkSize Chunk size in bytes, default 512KB.
+     * @return Whether initialization was successful.
      */
     fun initSearchEngine(
         bufferSize: Long,
         cacheFileDir: String,
-        chunkSize: Long = 512 * 1024, // Default: 512KB
+        chunkSize: Long = 512 * 1024,
     ): Boolean {
-        if(nativeInitSearchEngine(bufferSize, cacheFileDir, chunkSize)) {
+        if (nativeInitSearchEngine(bufferSize, cacheFileDir, chunkSize)) {
+            // Allocate shared buffer for progress communication.
+            sharedBuffer = ByteBuffer.allocateDirect(SHARED_BUFFER_SIZE).order(ByteOrder.LITTLE_ENDIAN)
+            nativeSetSharedBuffer(sharedBuffer!!)
             return true
         }
         return false
     }
 
     /**
-     * 执行精确搜索/联合搜索
-     * @param query 搜索内容
-     * @param type 数据类型
-     * @param ranges 内存区域集合
-     * @param useDeepSearch 是否使用深度搜索
-     * @param cb 搜索进度回调
-     * @return 搜索到的结果数量
+     * Gets the shared buffer for direct access to progress information.
+     * Can be used to read progress or request cancellation.
      */
+    fun getSharedBuffer(): ByteBuffer? = sharedBuffer
+
+    /**
+     * Reads current search status from shared buffer.
+     * @return One of Status constants.
+     */
+    fun getStatus(): Int = sharedBuffer?.getInt(Offset.STATUS) ?: Status.IDLE
+
+    /**
+     * Reads current progress from shared buffer.
+     * @return Progress value 0-100.
+     */
+    fun getProgress(): Int = sharedBuffer?.getInt(Offset.PROGRESS) ?: 0
+
+    /**
+     * Reads completed region count from shared buffer.
+     */
+    fun getRegionsDone(): Int = sharedBuffer?.getInt(Offset.REGIONS_DONE) ?: 0
+
+    /**
+     * Reads total found count from shared buffer.
+     */
+    fun getFoundCount(): Long = sharedBuffer?.getLong(Offset.FOUND_COUNT) ?: 0
+
+    /**
+     * Reads heartbeat value from shared buffer.
+     */
+    fun getHeartbeat(): Int = sharedBuffer?.getInt(Offset.HEARTBEAT) ?: 0
+
+    /**
+     * Reads error code from shared buffer.
+     * @return One of ErrorCode constants.
+     */
+    fun getErrorCode(): Int = sharedBuffer?.getInt(Offset.ERROR_CODE) ?: ErrorCode.NONE
+
+    /**
+     * Requests cancellation by writing to shared buffer. No JNI call needed.
+     */
+    fun requestCancelViaBuffer() {
+        sharedBuffer?.putInt(Offset.CANCEL_FLAG, 1)
+    }
+
+    /**
+     * Clears the cancel flag in shared buffer.
+     */
+    private fun clearCancelFlag() {
+        sharedBuffer?.putInt(Offset.CANCEL_FLAG, 0)
+    }
+
+    /**
+     * Checks if search is currently running.
+     */
+    fun isSearching(): Boolean = nativeIsSearching()
+
+    /**
+     * Requests cancellation via CancellationToken (JNI call).
+     */
+    fun requestCancel() {
+        nativeRequestCancel()
+    }
+
+    /**
+     * Starts an async exact/group search. Returns immediately.
+     * Progress is communicated via the shared buffer.
+     * @param query Search content.
+     * @param type Data type.
+     * @param ranges Memory range set.
+     * @param useDeepSearch Whether to use deep search.
+     * @return Whether the search started successfully.
+     */
+    fun startSearchAsync(
+        query: String,
+        type: DisplayValueType,
+        ranges: Set<MemoryRange>,
+        useDeepSearch: Boolean,
+    ): Boolean {
+        val nativeRegions = mutableListOf<Long>()
+
+        WuwaDriver.queryMemRegions()
+            .divideToSimpleMemoryRange()
+            .filter { ranges.contains(it.range) }
+            .forEach {
+                nativeRegions.add(it.start)
+                nativeRegions.add(it.end)
+            }
+
+        clearSharedBuffer()
+        newSharedBuffer()
+
+        return nativeStartSearchAsync(query, type.nativeId, nativeRegions.toLongArray(), useDeepSearch)
+    }
+
+    /**
+     * Starts an async exact/group search with custom memory regions.
+     * @param query Search content.
+     * @param type Data type.
+     * @param regions Memory region array, format [start1, end1, start2, end2, ...].
+     * @param useDeepSearch Whether to use deep search.
+     * @return Whether the search started successfully.
+     */
+    fun startSearchAsyncWithCustomRange(
+        query: String,
+        type: DisplayValueType,
+        regions: LongArray,
+        useDeepSearch: Boolean,
+    ): Boolean {
+        clearSharedBuffer()
+        if (!newSharedBuffer()) {
+            throw RuntimeException("failed to init SharedBuffer")
+        }
+        return nativeStartSearchAsync(query, type.nativeId, regions, useDeepSearch)
+    }
+
+    /**
+     * Starts an async refine search. Returns immediately.
+     * @param query Search content.
+     * @param type Data type.
+     * @return Whether the search started successfully.
+     */
+    fun startRefineAsync(
+        query: String,
+        type: DisplayValueType,
+    ): Boolean {
+        clearSharedBuffer()
+        newSharedBuffer()
+        return nativeStartRefineAsync(query, type.nativeId)
+    }
+
+    // Legacy synchronous methods kept for backward compatibility.
+
+    /**
+     * Executes exact/group search synchronously (legacy).
+     * @param query Search content.
+     * @param type Data type.
+     * @param ranges Memory range set.
+     * @param useDeepSearch Whether to use deep search.
+     * @param cb Search progress callback.
+     * @return Number of results found.
+     */
+    @Deprecated("Low performance")
     fun searchExact(
         query: String,
         type: DisplayValueType,
@@ -56,14 +243,9 @@ object SearchEngine {
     }
 
     /**
-     * 执行精确搜索/联合搜索，使用自定义内存区域
-     * @param query 搜索内容
-     * @param type 数据类型
-     * @param regions 内存区域数组，格式为[start1, end1, start2, end2, ...]
-     * @param useDeepSearch 是否使用深度搜索
-     * @param cb 搜索进度回调
-     * @return 搜索到的结果数量
+     * Executes exact/group search with custom regions synchronously (legacy).
      */
+    @Deprecated("Low performance")
     fun exactSearchWithCustomRange(
         query: String,
         type: DisplayValueType,
@@ -75,58 +257,52 @@ object SearchEngine {
     }
 
     /**
-     * 获取搜索结果
-     * @param start 起始索引
-     * @param count 获取数量
-     * @return 搜索结果数组
+     * Gets search results.
+     * @param start Starting index.
+     * @param count Number of results to get.
+     * @return Search result array.
      */
     fun getResults(start: Int, count: Int): Array<SearchResultItem> {
-        return nativeGetResults(start, count)
+        return nativeGetResults(start, count).also {
+            Log.w(TAG, "getResults($start, $count) -> ${it.size}")
+        }
     }
 
     /**
-     * 获取搜索结果总数
-     * @return 搜索结果总数
+     * Gets total result count.
      */
     fun getTotalResultCount(): Long {
         return nativeGetTotalResultCount()
     }
 
     /**
-     * 清除搜索结果
+     * Clears search results.
      */
     fun clearSearchResults() {
         nativeClearSearchResults()
     }
 
     /**
-     * 移除单个搜索结果
-     * @param index 搜索结果索引
-     * @return 是否移除成功
+     * Removes a single search result.
+     * @param index Search result index.
+     * @return Whether removal was successful.
      */
     fun removeResult(index: Int): Boolean {
         return nativeRemoveResult(index)
     }
 
     /**
-     * 移除多个搜索结果
-     * @param indices 搜索结果索引数组
-     * @return 是否移除成功
+     * Removes multiple search results.
+     * @param indices Search result index array.
+     * @return Whether removal was successful.
      */
     fun removeResults(indices: IntArray): Boolean {
         return nativeRemoveResults(indices)
     }
 
     /**
-     * 设置过滤条件 (地址范围、值范围、数据类型、权限)！
-     *
-     * 仅作用于搜索结果的过滤，不会影响实际搜索过程！
-     *
-     * @param enableAddressFilter 是否启用地址过滤
-     * @param addressStart 地址范围起始
-     * @param addressEnd 地址范围结束
-     * @param enableTypeFilter 是否启用数据类型过滤
-     * @param typeIds 数据类型ID数组
+     * Sets filter conditions (address range, value range, data type, permissions).
+     * Only affects search result filtering, does not affect actual search process.
      */
     fun setFilter(
         enableAddressFilter: Boolean,
@@ -142,15 +318,15 @@ object SearchEngine {
     }
 
     /**
-     * 清除所有过滤条件
+     * Clears all filter conditions.
      */
     fun clearFilter() {
         nativeClearFilter()
     }
 
     /**
-     * 获取当前搜索模式
-     * @return 当前搜索模式 (EXACT 或 FUZZY)
+     * Gets current search mode.
+     * @return Current search mode (EXACT or FUZZY).
      */
     fun getCurrentSearchMode(): SearchMode {
         val nativeValue = nativeGetCurrentSearchMode()
@@ -158,20 +334,9 @@ object SearchEngine {
     }
 
     /**
-     * 改善搜索 - 基于上一次搜索结果进行再次搜索
-     *
-     * 典型使用场景：
-     * 1. 第一次搜索金币数量 100 → 找到 10000 个地址
-     * 2. 改变游戏中的金币到 150
-     * 3. 改善搜索: 在上一次的 10000 个地址中，再搜索值为 150 的地址 → 缩小到 50 个地址
-     * 4. 继续改变金币到 200，再次改善搜索 → 最终定位到 1-2 个地址
-     *
-     * @param query 搜索内容
-     * @param type 数据类型
-     * @param memoryMode 内存搜索模式
-     * @param cb 搜索进度回调
-     * @return 搜索到的结果数量
+     * Executes refine search synchronously (legacy).
      */
+    @Deprecated("Low performance")
     fun refineSearch(
         query: String,
         type: DisplayValueType,
@@ -181,32 +346,59 @@ object SearchEngine {
     }
 
     /**
-     * 设置进度缓冲区（使用DirectByteBuffer共享内存）
-     *
-     * 缓冲区结构（20字节）：
-     * [0-3]   当前进度 (0-100)
-     * [4-7]   已搜索区域数
-     * [8-15]  当前找到的结果数
-     * [16-19] 心跳随机数（定期更新，用于检测是否卡死）
-     *
-     * @param buffer DirectByteBuffer，native层会直接写入进度数据
-     * @return 设置是否成功
+     * New shared buffer
      */
-    fun setProgressBuffer(buffer: ByteBuffer): Boolean {
-        if (!buffer.isDirect) {
-            throw IllegalArgumentException("Buffer must be a DirectByteBuffer")
+    private fun newSharedBuffer(): Boolean {
+        if (sharedBuffer != null) {
+            return false
         }
-        return nativeSetProgressBuffer(buffer)
+        val sharedBuffer = ByteBuffer.allocateDirect(SHARED_BUFFER_SIZE).order(ByteOrder.LITTLE_ENDIAN)
+        return setSharedBuffer(sharedBuffer)
     }
 
     /**
-     * 清除进度缓冲区
+     * Sets shared buffer (DirectByteBuffer).
+     * @param buffer DirectByteBuffer, native layer will directly read/write progress data.
+     * @return Whether setting was successful.
      */
-    fun clearProgressBuffer() {
-        nativeClearProgressBuffer()
+    private fun setSharedBuffer(buffer: ByteBuffer): Boolean {
+        if (!buffer.isDirect) {
+            throw IllegalArgumentException("Buffer must be a DirectByteBuffer")
+        }
+        if (buffer.capacity() < SHARED_BUFFER_SIZE) {
+            throw IllegalArgumentException("Buffer must be at least $SHARED_BUFFER_SIZE bytes")
+        }
+        sharedBuffer = buffer
+        return nativeSetSharedBuffer(buffer)
     }
 
+    /**
+     * Clears shared buffer.
+     */
+    private fun clearSharedBuffer() {
+        nativeClearSharedBuffer()
+        sharedBuffer = null
+    }
+
+    // Legacy methods for backward compatibility.
+
+    @Deprecated("Use setSharedBuffer instead", ReplaceWith("setSharedBuffer(buffer)"))
+    private fun setProgressBuffer(buffer: ByteBuffer): Boolean = setSharedBuffer(buffer)
+
+    @Deprecated("Use clearSharedBuffer instead", ReplaceWith("clearSharedBuffer()"))
+    private fun clearProgressBuffer() = clearSharedBuffer()
+
+    // Native method declarations.
     private external fun nativeInitSearchEngine(bufferSize: Long, cacheFileDir: String, chunkSize: Long): Boolean
+
+    private external fun nativeSetSharedBuffer(buffer: ByteBuffer): Boolean
+    private external fun nativeClearSharedBuffer()
+
+    private external fun nativeStartSearchAsync(query: String, defaultType: Int, regions: LongArray, useDeepSearch: Boolean): Boolean
+    private external fun nativeStartRefineAsync(query: String, defaultType: Int): Boolean
+    private external fun nativeIsSearching(): Boolean
+    private external fun nativeRequestCancel()
+
     private external fun nativeSearch(
         query: String,
         defaultType: Int,
@@ -228,35 +420,16 @@ object SearchEngine {
         typeIds: IntArray,
     )
     private external fun nativeClearFilter()
-
-    /**
-     * 获取当前搜索模式（native）
-     * @return 搜索模式的原生值 (0=EXACT, 1=FUZZY)
-     */
     private external fun nativeGetCurrentSearchMode(): Int
-
-    /**
-     * 改善搜索（native）- 基于上一次搜索结果进行再次搜索
-     * @param query 搜索内容
-     * @param defaultType 数据类型ID
-     * @param cb 搜索进度回调
-     * @return 搜索到的结果数量
-     */
     private external fun nativeRefineSearch(
         query: String,
         defaultType: Int,
         cb: SearchProgressCallback
     ): Long
 
-    /**
-     * 设置进度缓冲区（native）
-     * @param buffer DirectByteBuffer
-     * @return 设置是否成功
-     */
+    // Legacy native methods kept for backward compatibility.
+    @Deprecated("Low performance")
     private external fun nativeSetProgressBuffer(buffer: ByteBuffer): Boolean
-
-    /**
-     * 清除进度缓冲区（native）
-     */
+    @Deprecated("Low performance")
     private external fun nativeClearProgressBuffer()
 }

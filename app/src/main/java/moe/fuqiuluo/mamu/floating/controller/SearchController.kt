@@ -277,6 +277,7 @@ class SearchController(
         coroutineScope.launch {
             runCatching {
                 val addresses = withContext(Dispatchers.IO) {
+                    //println("77777777777777777777777")
                     SearchEngine.getResults(offset, limit).toList()
                 }
 
@@ -284,7 +285,7 @@ class SearchController(
                     if (offset == 0) {
                         searchResultAdapter.clearResults()
                         showEmptyState(true)
-                        notification.showError("没有找到结果")
+                        notification.showError("没有找到结果($limit)")
                     }
                     return@launch
                 }
@@ -301,8 +302,8 @@ class SearchController(
         }
     }
 
-    fun onSearchCompleted(ranges: List<DisplayMemRegionEntry>) {
-        val totalCount = SearchEngine.getTotalResultCount().toInt()
+    fun onSearchCompleted(ranges: List<DisplayMemRegionEntry>, totalFound: Long) {
+        val totalCount = totalFound.toInt()
 
         val mmkv = MMKV.defaultMMKV()
         if (totalCount > 0) {
@@ -340,12 +341,12 @@ class SearchController(
                 notification = notification,
                 searchDialogState = searchDialogState,
                 clipboardManager = clipboardManager,
-                onSearchCompleted = {
-                    onSearchCompleted(it)
+                onSearchCompleted = { ranges, totalFound ->
+                    onSearchCompleted(ranges, totalFound)
                     allSearchComplete()
                 },
-                onRefineCompleted = {
-                    onRefineCompleted()
+                onRefineCompleted = { totalFound ->
+                    onRefineCompleted(totalFound)
                     allSearchComplete()
                 }
             ).apply {
@@ -372,8 +373,8 @@ class SearchController(
         searchDialog?.showProgressDialogIfSearching()
     }
 
-    private fun onRefineCompleted() {
-        val totalCount = SearchEngine.getTotalResultCount().toInt()
+    private fun onRefineCompleted(totalFound: Long) {
+        val totalCount = totalFound.toInt()
 
         val mmkv = MMKV.defaultMMKV()
         if (totalCount > 0) {
