@@ -30,21 +30,6 @@
             style="@style/KeyboardIconButton"
             android:contentDescription="删除"
             android:src="@drawable/backspace_24px" />
-
-        <View
-            android:layout_width="0dp"
-            android:layout_height="0dp"
-            android:layout_weight="1" />
-
-        <View
-            android:layout_width="0dp"
-            android:layout_height="0dp"
-            android:layout_weight="1" />
-
-        <View
-            android:layout_width="0dp"
-            android:layout_height="0dp"
-            android:layout_weight="1" />
     </LinearLayout>
 
     <LinearLayout
@@ -73,21 +58,6 @@
             style="@style/KeyboardIconButton"
             android:contentDescription="全选"
             android:src="@drawable/select_all_24px" />
-
-        <View
-            android:layout_width="0dp"
-            android:layout_height="0dp"
-            android:layout_weight="1" />
-
-        <View
-            android:layout_width="0dp"
-            android:layout_height="0dp"
-            android:layout_weight="1" />
-
-        <View
-            android:layout_width="0dp"
-            android:layout_height="0dp"
-            android:layout_weight="1" />
     </LinearLayout>
 
     <LinearLayout
@@ -115,21 +85,6 @@
             android:id="@+id/key_colon"
             style="@style/KeyboardButton"
             android:text=":" />
-
-        <View
-            android:layout_width="0dp"
-            android:layout_height="0dp"
-            android:layout_weight="1" />
-
-        <View
-            android:layout_width="0dp"
-            android:layout_height="0dp"
-            android:layout_weight="1" />
-
-        <View
-            android:layout_width="0dp"
-            android:layout_height="0dp"
-            android:layout_weight="1" />
     </LinearLayout>
 
     <LinearLayout
@@ -158,21 +113,6 @@
             android:id="@+id/key_semicolon"
             style="@style/KeyboardButton"
             android:text=";" />
-
-        <View
-            android:layout_width="0dp"
-            android:layout_height="0dp"
-            android:layout_weight="1" />
-
-        <View
-            android:layout_width="0dp"
-            android:layout_height="0dp"
-            android:layout_weight="1" />
-
-        <View
-            android:layout_width="0dp"
-            android:layout_height="0dp"
-            android:layout_weight="1" />
     </LinearLayout>
 
     <LinearLayout
@@ -203,21 +143,6 @@
             style="@style/KeyboardIconButton"
             android:contentDescription="展开"
             android:src="@drawable/unfold_more_24px" />
-
-        <View
-            android:layout_width="0dp"
-            android:layout_height="0dp"
-            android:layout_weight="1" />
-
-        <View
-            android:layout_width="0dp"
-            android:layout_height="0dp"
-            android:layout_weight="1" />
-
-        <View
-            android:layout_width="0dp"
-            android:layout_height="0dp"
-            android:layout_weight="1" />
     </LinearLayout>
 
 </LinearLayout>
