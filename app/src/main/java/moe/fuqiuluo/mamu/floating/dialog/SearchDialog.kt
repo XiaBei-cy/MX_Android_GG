@@ -20,7 +20,7 @@ import moe.fuqiuluo.mamu.R
 import moe.fuqiuluo.mamu.databinding.DialogSearchInputBinding
 import moe.fuqiuluo.mamu.driver.SearchEngine
 import moe.fuqiuluo.mamu.driver.WuwaDriver
-import moe.fuqiuluo.mamu.data.settings.floatingOpacity
+import moe.fuqiuluo.mamu.data.settings.getDialogOpacity
 import moe.fuqiuluo.mamu.data.settings.keyboardType
 import moe.fuqiuluo.mamu.data.settings.selectedMemoryRanges
 import moe.fuqiuluo.mamu.floating.ext.divideToSimpleMemoryRange
@@ -30,7 +30,6 @@ import moe.fuqiuluo.mamu.floating.data.model.DisplayValueType
 import moe.fuqiuluo.mamu.widget.BuiltinKeyboard
 import moe.fuqiuluo.mamu.widget.NotificationOverlay
 import moe.fuqiuluo.mamu.widget.simpleSingleChoiceDialog
-import kotlin.math.max
 
 data class SearchDialogState(
     var lastSelectedValueType: DisplayValueType = DisplayValueType.DWORD,
@@ -242,8 +241,8 @@ class SearchDialog(
         dialog.setContentView(binding.root)
 
         val mmkv = MMKV.defaultMMKV()
-        val opacity = mmkv.floatingOpacity
-        binding.rootContainer.background?.alpha = (max(opacity, 0.85f) * 255).toInt()
+        val opacity = mmkv.getDialogOpacity()
+        binding.rootContainer.background?.alpha = (opacity * 255).toInt()
 
         val isPortrait =
             context.resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT

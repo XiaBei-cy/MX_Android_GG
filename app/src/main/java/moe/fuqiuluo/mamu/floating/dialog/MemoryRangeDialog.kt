@@ -6,9 +6,8 @@ import android.widget.ListView
 import com.tencent.mmkv.MMKV
 import moe.fuqiuluo.mamu.databinding.DialogMultiChoiceBinding
 import moe.fuqiuluo.mamu.floating.adapter.MemoryRangeAdapter
-import moe.fuqiuluo.mamu.data.settings.floatingOpacity
+import moe.fuqiuluo.mamu.data.settings.getDialogOpacity
 import moe.fuqiuluo.mamu.floating.data.model.MemoryRange
-import kotlin.math.max
 
 class MemoryRangeDialog(
     context: Context,
@@ -27,8 +26,8 @@ class MemoryRangeDialog(
 
         // 应用透明度设置
         val mmkv = MMKV.defaultMMKV()
-        val opacity = mmkv.floatingOpacity
-        binding.rootContainer.background?.alpha = (max(opacity, 0.85f) * 255).toInt()
+        val opacity = mmkv.getDialogOpacity()
+        binding.rootContainer.background?.alpha = (opacity * 255).toInt()
 
         // 设置标题
         binding.dialogTitle.text = "选择内存范围"

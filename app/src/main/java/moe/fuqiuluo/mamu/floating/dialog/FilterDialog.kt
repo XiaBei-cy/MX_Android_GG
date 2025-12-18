@@ -10,13 +10,12 @@ import android.widget.EditText
 import com.tencent.mmkv.MMKV
 import moe.fuqiuluo.mamu.R
 import moe.fuqiuluo.mamu.databinding.DialogFilterBinding
-import moe.fuqiuluo.mamu.data.settings.floatingOpacity
+import moe.fuqiuluo.mamu.data.settings.getDialogOpacity
 import moe.fuqiuluo.mamu.data.settings.keyboardType
 import moe.fuqiuluo.mamu.floating.data.model.DisplayValueType
 import moe.fuqiuluo.mamu.widget.BuiltinKeyboard
 import moe.fuqiuluo.mamu.widget.NotificationOverlay
 import moe.fuqiuluo.mamu.widget.multiChoiceDialog
-import kotlin.math.max
 
 class FilterDialog(
     context: Context,
@@ -36,8 +35,8 @@ class FilterDialog(
 
         // 应用透明度设置
         val mmkv = MMKV.defaultMMKV()
-        val opacity = mmkv.floatingOpacity
-        binding.rootContainer.background?.alpha = (max(opacity, 0.85f) * 255).toInt()
+        val opacity = mmkv.getDialogOpacity()
+        binding.rootContainer.background?.alpha = (opacity * 255).toInt()
 
         val isPortrait =
             context.resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT

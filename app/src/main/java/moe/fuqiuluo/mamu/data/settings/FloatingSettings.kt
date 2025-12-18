@@ -30,6 +30,7 @@ private const val KEY_TAB_SWITCH_ANIMATION = "tab_switch_animation"
 private const val KEY_RUDE_SEARCH = "rude_search"
 private const val KEY_FAILED_PAGE_THRESHOLD = "failed_page_threshold"
 private const val KEY_CHUNK_SIZE = "chunk_size"
+private const val KEY_DIALOG_TRANSPARENCY_ENABLED = "dialog_transparency_enabled"
 
 private const val DEFAULT_OPACITY = 0.55f
 private const val DEFAULT_MEMORY_BUFFER_SIZE = 512
@@ -48,6 +49,7 @@ private const val DEFAULT_TOP_MOST_LAYER = false // 默认不启用最高层级�
 private const val DEFAULT_TAB_SWITCH_ANIMATION = false // 默认不启用Tab切换动画
 private const val DEFAULT_RUDE_SEARCH = true // 默认不启用粗鲁搜索模式
 private const val DEFAULT_FAILED_PAGE_THRESHOLD = 4 // 默认连续失败页阈值
+private const val DEFAULT_DIALOG_TRANSPARENCY_ENABLED = true // 默认启用dialog透明度
 
 /**
  * 悬浮窗透明度 (0.0 - 1.0)
@@ -259,3 +261,27 @@ var MMKV.chunkSize: Int
     set(value) {
         encode(KEY_CHUNK_SIZE, value)
     }
+
+/**
+ * Dialog透明度开关
+ * true = 启用透明度效果 (默认)
+ * false = 禁用透明度效果 (完全不透明)
+ */
+var MMKV.dialogTransparencyEnabled: Boolean
+    get() = decodeBool(KEY_DIALOG_TRANSPARENCY_ENABLED, DEFAULT_DIALOG_TRANSPARENCY_ENABLED)
+    set(value) {
+        encode(KEY_DIALOG_TRANSPARENCY_ENABLED, value)
+    }
+
+/**
+ * 获取Dialog的实际透明度
+ * 如果关闭了透明度开关，返回1.0f（完全不透明）
+ * 否则返回配置的透明度值，但最低为0.85f
+ */
+fun MMKV.getDialogOpacity(): Float {
+    return if (dialogTransparencyEnabled) {
+        kotlin.math.max(floatingOpacity, 0.85f)
+    } else {
+        1.0f
+    }
+}

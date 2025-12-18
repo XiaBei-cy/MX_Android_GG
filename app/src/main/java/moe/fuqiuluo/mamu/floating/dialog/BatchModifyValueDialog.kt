@@ -12,14 +12,13 @@ import moe.fuqiuluo.mamu.databinding.DialogModifyValueBinding
 import moe.fuqiuluo.mamu.driver.ExactSearchResultItem
 import moe.fuqiuluo.mamu.driver.FuzzySearchResultItem
 import moe.fuqiuluo.mamu.driver.SearchResultItem
-import moe.fuqiuluo.mamu.data.settings.floatingOpacity
+import moe.fuqiuluo.mamu.data.settings.getDialogOpacity
 import moe.fuqiuluo.mamu.data.settings.keyboardType
 import moe.fuqiuluo.mamu.floating.data.model.DisplayValueType
 import moe.fuqiuluo.mamu.floating.data.model.SavedAddress
 import moe.fuqiuluo.mamu.widget.BuiltinKeyboard
 import moe.fuqiuluo.mamu.widget.NotificationOverlay
 import moe.fuqiuluo.mamu.widget.simpleSingleChoiceDialog
-import kotlin.math.max
 
 class BatchModifyValueDialog private constructor(
     context: Context,
@@ -77,8 +76,8 @@ class BatchModifyValueDialog private constructor(
 
         // 应用透明度设置
         val mmkv = MMKV.defaultMMKV()
-        val opacity = mmkv.floatingOpacity
-        binding.rootContainer.background?.alpha = (max(opacity, 0.85f) * 255).toInt()
+        val opacity = mmkv.getDialogOpacity()
+        binding.rootContainer.background?.alpha = (opacity * 255).toInt()
 
         val isPortrait =
             context.resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT

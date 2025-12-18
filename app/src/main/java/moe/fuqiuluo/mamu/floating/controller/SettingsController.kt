@@ -16,6 +16,7 @@ import moe.fuqiuluo.mamu.floating.dialog.MemoryRangeDialog
 import moe.fuqiuluo.mamu.floating.dialog.customDialog
 import moe.fuqiuluo.mamu.data.settings.autoPause
 import moe.fuqiuluo.mamu.data.settings.chunkSize
+import moe.fuqiuluo.mamu.data.settings.dialogTransparencyEnabled
 import moe.fuqiuluo.mamu.data.settings.filterLinuxProcess
 import moe.fuqiuluo.mamu.data.settings.filterSystemProcess
 import moe.fuqiuluo.mamu.data.settings.floatingOpacity
@@ -74,6 +75,7 @@ class SettingsController(
         setupListUpdateInterval(mmkv)
         setupMemoryRwMode()
         setupOpacityControl(mmkv)
+        setupDialogTransparency(mmkv)
         setupMemoryBufferSizeControl()
         setupChunkSizeControl()
         setupKeyboard()
@@ -230,6 +232,15 @@ class SettingsController(
                 val opacity = intValue / 100f
                 mmkv.floatingOpacity = opacity
                 onApplyOpacity()
+            }
+        }
+    }
+
+    private fun setupDialogTransparency(mmkv: MMKV) {
+        binding.switchDialogTransparency.apply {
+            isChecked = mmkv.dialogTransparencyEnabled
+            setOnCheckedChangeListener { _, isChecked ->
+                mmkv.dialogTransparencyEnabled = isChecked
             }
         }
     }

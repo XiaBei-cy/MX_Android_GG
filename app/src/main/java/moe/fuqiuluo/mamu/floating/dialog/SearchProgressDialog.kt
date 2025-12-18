@@ -5,8 +5,9 @@ import android.content.Context
 import android.view.LayoutInflater
 import com.tencent.mmkv.MMKV
 import moe.fuqiuluo.mamu.R
+import moe.fuqiuluo.mamu.data.settings.dialogTransparencyEnabled
 import moe.fuqiuluo.mamu.databinding.DialogSearchProgressBinding
-import moe.fuqiuluo.mamu.data.settings.floatingOpacity
+import moe.fuqiuluo.mamu.data.settings.getDialogOpacity
 import kotlin.math.max
 import kotlin.random.Random
 
@@ -40,8 +41,13 @@ class SearchProgressDialog(
         dialog.setCancelable(false)
 
         // 应用透明度设置
-        val opacity = MMKV.defaultMMKV().floatingOpacity
-        binding.root.background?.alpha = (max(opacity, 0.95f) * 255).toInt()
+        val mmkv = MMKV.defaultMMKV()
+        val opacity = if (mmkv.dialogTransparencyEnabled) {
+            max(mmkv.getDialogOpacity(), 0.95f)
+        } else {
+            1.0f
+        }
+        binding.root.background?.alpha = (opacity * 255).toInt()
 
         // 随机显示一个萌系标题
         binding.progressTitle.text = MOE_TITLES.random()

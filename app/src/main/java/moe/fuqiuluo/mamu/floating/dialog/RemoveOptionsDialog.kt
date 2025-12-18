@@ -8,8 +8,7 @@ import android.view.View
 import androidx.core.widget.ImageViewCompat
 import com.tencent.mmkv.MMKV
 import moe.fuqiuluo.mamu.databinding.DialogRemoveOptionsBinding
-import moe.fuqiuluo.mamu.data.settings.floatingOpacity
-import kotlin.math.max
+import moe.fuqiuluo.mamu.data.settings.getDialogOpacity
 
 class RemoveOptionsDialog(
     context: Context,
@@ -29,8 +28,8 @@ class RemoveOptionsDialog(
 
         // 应用透明度设置
         val mmkv = MMKV.defaultMMKV()
-        val opacity = mmkv.floatingOpacity
-        binding.rootContainer.background?.alpha = (max(opacity, 0.85f) * 255).toInt()
+        val opacity = mmkv.getDialogOpacity()
+        binding.rootContainer.background?.alpha = (opacity * 255).toInt()
 
         if (showTitleIcon) {
             binding.iconTitle.visibility = View.VISIBLE
