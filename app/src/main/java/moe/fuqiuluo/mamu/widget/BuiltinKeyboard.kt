@@ -12,6 +12,8 @@ import android.widget.Button
 import android.widget.FrameLayout
 import moe.fuqiuluo.mamu.R
 import androidx.core.content.withStyledAttributes
+import com.tencent.mmkv.MMKV
+import moe.fuqiuluo.mamu.data.settings.keyboardState
 
 class BuiltinKeyboard @JvmOverloads constructor(
     context: Context,
@@ -38,6 +40,7 @@ class BuiltinKeyboard @JvmOverloads constructor(
     var listener: KeyboardListener? = null
     private var currentState = KeyboardState.EXPANDED
     private var isPortrait = true
+    private val mmkv: MMKV by lazy { MMKV.defaultMMKV() }
 
     // 长按重复功能
     private val handler = Handler(Looper.getMainLooper())
@@ -49,19 +52,27 @@ class BuiltinKeyboard @JvmOverloads constructor(
     }
 
     init {
-        attrs?.let {
-            context.withStyledAttributes(it, R.styleable.BuiltinKeyboard) {
-                val defaultExpanded = getBoolean(R.styleable.BuiltinKeyboard_defaultExpanded, true)
-                currentState =
-                    if (defaultExpanded) KeyboardState.EXPANDED else KeyboardState.COLLAPSED
-            }
+        // 从 MMKV 读取保存的键盘状态
+        val savedState = mmkv.keyboardState
+        currentState = when (savedState) {
+            0 -> KeyboardState.COLLAPSED
+            1 -> KeyboardState.EXPANDED
+            2 -> KeyboardState.FUNCTION
+            else -> KeyboardState.EXPANDED
         }
+
         buildKeyboard()
     }
 
     fun setState(state: KeyboardState) {
         if (currentState != state) {
             currentState = state
+            // 保存状态到 MMKV
+            mmkv.keyboardState = when (state) {
+                KeyboardState.COLLAPSED -> 0
+                KeyboardState.EXPANDED -> 1
+                KeyboardState.FUNCTION -> 2
+            }
             buildKeyboard()
         }
     }

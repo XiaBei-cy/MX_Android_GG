@@ -31,6 +31,7 @@ private const val KEY_RUDE_SEARCH = "rude_search"
 private const val KEY_FAILED_PAGE_THRESHOLD = "failed_page_threshold"
 private const val KEY_CHUNK_SIZE = "chunk_size"
 private const val KEY_DIALOG_TRANSPARENCY_ENABLED = "dialog_transparency_enabled"
+private const val KEY_KEYBOARD_STATE = "keyboard_state"
 
 private const val DEFAULT_OPACITY = 0.55f
 private const val DEFAULT_MEMORY_BUFFER_SIZE = 512
@@ -50,6 +51,7 @@ private const val DEFAULT_TAB_SWITCH_ANIMATION = false // 默认不启用Tab切�
 private const val DEFAULT_RUDE_SEARCH = true // 默认不启用粗鲁搜索模式
 private const val DEFAULT_FAILED_PAGE_THRESHOLD = 4 // 默认连续失败页阈值
 private const val DEFAULT_DIALOG_TRANSPARENCY_ENABLED = true // 默认启用dialog透明度
+private const val DEFAULT_KEYBOARD_STATE = 1 // 默认展开 (0=折叠, 1=展开, 2=功能)
 
 /**
  * 悬浮窗透明度 (0.0 - 1.0)
@@ -285,3 +287,15 @@ fun MMKV.getDialogOpacity(): Float {
         1.0f
     }
 }
+
+/**
+ * 内置键盘状态
+ * 0 = 折叠 (COLLAPSED)
+ * 1 = 展开 (EXPANDED)
+ * 2 = 功能 (FUNCTION)
+ */
+var MMKV.keyboardState: Int
+    get() = decodeInt(KEY_KEYBOARD_STATE, DEFAULT_KEYBOARD_STATE)
+    set(value) {
+        encode(KEY_KEYBOARD_STATE, value)
+    }
