@@ -36,6 +36,11 @@ import moe.fuqiuluo.mamu.utils.ByteFormatUtils.formatBytes
 import moe.fuqiuluo.mamu.widget.NotificationOverlay
 import moe.fuqiuluo.mamu.widget.ToolbarAction
 import moe.fuqiuluo.mamu.widget.simpleSingleChoiceDialog
+import com.tencent.mmkv.MMKV
+import moe.fuqiuluo.mamu.data.settings.saveListUpdateInterval
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 
 class SavedAddressController(
     context: Context,
@@ -67,6 +72,9 @@ class SavedAddressController(
     )
 
     private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+
+    // 自动更新协程任务
+    private var autoUpdateJob: Job? = null
 
     override fun initialize() {
         setupToolbar()
@@ -115,12 +123,16 @@ class SavedAddressController(
             FloatingEventBus.processStateEvents.collect { event ->
                 when (event.type) {
                     ProcessStateEvent.Type.BOUND -> {
-                        // 绑定新进程时，先清空旧地址再更新显示
+                        // 绑定新进程时，先停止旧的更新，清空地址，再启动新的更新
+                        stopAutoUpdate()
                         clearAll()
                         updateProcessDisplay(event.process)
+                        startAutoUpdate()
                     }
                     ProcessStateEvent.Type.UNBOUND,
                     ProcessStateEvent.Type.DIED -> {
+                        // 进程解绑或死亡时，立即停止更新并清空
+                        stopAutoUpdate()
                         clearAll()
                         updateProcessDisplay(null)
                     }
@@ -1041,8 +1053,110 @@ class SavedAddressController(
         }
     }
 
+    /**
+     * 启动自动更新（只更新可见部分）
+     */
+    fun startAutoUpdate() {
+        // 如果已有任务在运行，先停止
+        stopAutoUpdate()
+
+        autoUpdateJob = coroutineScope.launch {
+            while (isActive) {
+                val interval = MMKV.defaultMMKV().saveListUpdateInterval.toLong()
+                delay(interval)
+                updateVisibleAddresses()
+            }
+        }
+    }
+
+    /**
+     * 停止自动更新
+     */
+    fun stopAutoUpdate() {
+        autoUpdateJob?.cancel()
+        autoUpdateJob = null
+    }
+
+    /**
+     * 只更新可见范围的地址值（优化性能）
+     */
+    private suspend fun updateVisibleAddresses() {
+        // 记录当前进程 PID（窗口期保护）
+        val currentPid = WuwaDriver.currentBindPid
+        if (savedAddresses.isEmpty() || currentPid <= 0) {
+            return
+        }
+
+        // 获取可见范围
+        val layoutManager = binding.savedAddressesRecyclerView.layoutManager as? LinearLayoutManager
+            ?: return
+
+        val firstVisible = layoutManager.findFirstVisibleItemPosition()
+        val lastVisible = layoutManager.findLastVisibleItemPosition()
+
+        if (firstVisible < 0 || lastVisible < 0 || firstVisible > lastVisible) {
+            return
+        }
+
+        // 安全的边界检查
+        val safeFirst = firstVisible.coerceIn(0, savedAddresses.size - 1)
+        val safeLast = lastVisible.coerceIn(0, savedAddresses.size - 1)
+
+        if (safeFirst > safeLast) return
+
+        // 创建快照（防止并发修改）
+        val snapshot = try {
+            savedAddresses.subList(safeFirst, safeLast + 1).toList()
+        } catch (e: Exception) {
+            return
+        }
+
+        // 准备批量读取参数
+        val addrs = snapshot.map { it.address }.toLongArray()
+        val sizes = snapshot.map {
+            it.displayValueType?.memorySize?.toInt() ?: DisplayValueType.DWORD.memorySize.toInt()
+        }.toIntArray()
+
+        val results = try {
+            withContext(Dispatchers.IO) {
+                WuwaDriver.batchReadMemory(addrs, sizes)
+            }
+        } catch (e: Exception) {
+            return
+        }
+
+        // 关键检查：进程是否还是同一个？
+        if (WuwaDriver.currentBindPid != currentPid) {
+            // 进程已切换，丢弃这批数据
+            return
+        }
+
+        // 安全更新 UI（通过地址查找，即使列表变化也不会崩溃）
+        results.forEachIndexed { index, bytes ->
+            try {
+                val snapshotItem = snapshot[index]
+                val currentIndex = savedAddresses.indexOfFirst { it.address == snapshotItem.address }
+
+                if (currentIndex >= 0 && bytes != null) {
+                    val valueType = savedAddresses[currentIndex].displayValueType
+                        ?: DisplayValueType.DWORD
+                    val newValue = ValueTypeUtils.bytesToDisplayValue(bytes, valueType)
+
+                    // 只在值变化时更新，避免无意义的刷新
+                    if (savedAddresses[currentIndex].value != newValue) {
+                        savedAddresses[currentIndex] = savedAddresses[currentIndex].copy(value = newValue)
+                        adapter.updateAddress(savedAddresses[currentIndex])
+                    }
+                }
+            } catch (e: Exception) {
+                // 忽略单个地址的错误，继续处理其他地址
+            }
+        }
+    }
+
     override fun cleanup() {
         super.cleanup()
+        stopAutoUpdate()
         coroutineScope.cancel()
     }
 }
