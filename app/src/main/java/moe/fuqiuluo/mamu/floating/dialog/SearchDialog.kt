@@ -23,6 +23,8 @@ import moe.fuqiuluo.mamu.driver.WuwaDriver
 import moe.fuqiuluo.mamu.data.settings.getDialogOpacity
 import moe.fuqiuluo.mamu.data.settings.keyboardType
 import moe.fuqiuluo.mamu.data.settings.selectedMemoryRanges
+import moe.fuqiuluo.mamu.floating.event.FloatingEventBus
+import moe.fuqiuluo.mamu.floating.event.UIActionEvent
 import moe.fuqiuluo.mamu.floating.ext.divideToSimpleMemoryRange
 import moe.fuqiuluo.mamu.floating.ext.formatElapsedTime
 import moe.fuqiuluo.mamu.floating.data.model.DisplayMemRegionEntry
@@ -58,9 +60,6 @@ class SearchDialog(
 
     // 搜索开始时间
     private var searchStartTime = 0L
-
-    // 退出全屏回调（用于隐藏按钮点击）
-    var onExitFullscreen: (() -> Unit)? = null
 
     /**
      * 读取进度数据从共享缓冲区
@@ -182,7 +181,10 @@ class SearchDialog(
                 cancelSearch()
             },
             onHideClick = {
-                onExitFullscreen?.invoke()
+                // 发送隐藏悬浮窗事件
+                searchScope.launch {
+                    FloatingEventBus.emitUIAction(UIActionEvent.HideFloatingWindow)
+                }
             }
         ).apply {
             show()
@@ -226,7 +228,10 @@ class SearchDialog(
                     cancelSearch()
                 },
                 onHideClick = {
-                    onExitFullscreen?.invoke()
+                    // 发送隐藏悬浮窗事件
+                    searchScope.launch {
+                        FloatingEventBus.emitUIAction(UIActionEvent.HideFloatingWindow)
+                    }
                 }
             ).apply {
                 show()

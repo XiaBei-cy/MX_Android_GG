@@ -2,18 +2,14 @@ package moe.fuqiuluo.mamu.floating.controller
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.content.pm.PackageManager
-import android.util.Log
 import android.view.View
 import com.tencent.mmkv.MMKV
 import kotlinx.coroutines.*
 import moe.fuqiuluo.mamu.R
+import moe.fuqiuluo.mamu.floating.event.FloatingEventBus
+import moe.fuqiuluo.mamu.floating.event.ProcessStateEvent
+import moe.fuqiuluo.mamu.floating.event.UIActionEvent
 import moe.fuqiuluo.mamu.databinding.FloatingSettingsLayoutBinding
-import moe.fuqiuluo.mamu.driver.ProcessDeathMonitor
-import moe.fuqiuluo.mamu.driver.WuwaDriver
-import moe.fuqiuluo.mamu.floating.adapter.ProcessListAdapter
-import moe.fuqiuluo.mamu.floating.dialog.MemoryRangeDialog
-import moe.fuqiuluo.mamu.floating.dialog.customDialog
 import moe.fuqiuluo.mamu.data.settings.autoPause
 import moe.fuqiuluo.mamu.data.settings.chunkSize
 import moe.fuqiuluo.mamu.data.settings.dialogTransparencyEnabled
@@ -34,32 +30,15 @@ import moe.fuqiuluo.mamu.data.settings.selectedMemoryRanges
 import moe.fuqiuluo.mamu.data.settings.skipMemoryOption
 import moe.fuqiuluo.mamu.data.settings.tabSwitchAnimation
 import moe.fuqiuluo.mamu.data.settings.topMostLayer
-import moe.fuqiuluo.mamu.floating.ext.divideToSimpleMemoryRange
 import moe.fuqiuluo.mamu.floating.data.model.DisplayProcessInfo
-import moe.fuqiuluo.mamu.floating.data.model.MemoryRange
-import moe.fuqiuluo.mamu.utils.ApplicationUtils
-import moe.fuqiuluo.mamu.utils.RootConfigManager
-import moe.fuqiuluo.mamu.utils.RootShellExecutor
-import moe.fuqiuluo.mamu.utils.onError
-import moe.fuqiuluo.mamu.utils.onSuccess
 import moe.fuqiuluo.mamu.widget.NotificationOverlay
 import moe.fuqiuluo.mamu.widget.simpleSingleChoiceDialog
-
-private const val TAG = "SettingsController"
 
 class SettingsController(
     context: Context,
     binding: FloatingSettingsLayoutBinding,
-    notification: NotificationOverlay,
-    private val packageManager: PackageManager,
-    private val onUpdateTopIcon: (DisplayProcessInfo?) -> Unit,
-    private val onUpdateSearchProcessDisplay: (DisplayProcessInfo?) -> Unit,
-    private val onBoundProcessChanged: () -> Unit,
-    private val onUpdateMemoryRangeSummary: () -> Unit,
-    private val onApplyOpacity: () -> Unit,
-    private val processDeathCallback: ProcessDeathMonitor.Callback
+    notification: NotificationOverlay
 ) : FloatingController<FloatingSettingsLayoutBinding>(context, binding, notification) {
-
     private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     override fun initialize() {
@@ -82,38 +61,72 @@ class SettingsController(
         setupLanguage()
         setupTopMostLayer(mmkv)
         setupTabAnimation(mmkv)
+
+        subscribeToProcessStateEvents()
+        subscribeToMemoryRangeChangedEvents()
+    }
+
+    /**
+     * 订阅进程状态变更事件
+     */
+    private fun subscribeToProcessStateEvents() {
+        coroutineScope.launch {
+            FloatingEventBus.processStateEvents.collect { event ->
+                when (event.type) {
+                    ProcessStateEvent.Type.BOUND -> {
+                        updateCurrentProcessDisplay(event.process)
+                    }
+
+                    ProcessStateEvent.Type.UNBOUND,
+                    ProcessStateEvent.Type.DIED -> {
+                        updateCurrentProcessDisplay(null)
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 订阅内存范围配置变更事件
+     */
+    private fun subscribeToMemoryRangeChangedEvents() {
+        coroutineScope.launch {
+            FloatingEventBus.memoryRangeChangedEvents.collect {
+                updateMemoryRangeSummary()
+            }
+        }
     }
 
     private fun setupProcessSelection() {
         binding.settingSelectProcess.setOnClickListener {
-            showProcessSelectionDialog()
+            // 发送 UI 操作事件，由 Service 统一处理
+            coroutineScope.launch {
+                FloatingEventBus.emitUIAction(UIActionEvent.ShowProcessSelectionDialog)
+            }
         }
         updateCurrentProcessDisplay(null)
 
         binding.btnTerminateProc.setOnClickListener {
-            if (WuwaDriver.isProcessBound) {
-                RootShellExecutor.exec(suCmd = RootConfigManager.getCustomRootCommand(), "kill -9 ${WuwaDriver.currentBindPid}", 1000).onSuccess {
-                    notification.showSuccess(context.getString(R.string.success_process_terminated))
-                    updateCurrentProcessDisplay(null)
-                }.onError {
-                    notification.showError(context.getString(R.string.error_terminate_failed))
-                }
-
-                WuwaDriver.unbindProcess()
-                ProcessDeathMonitor.stop()
-            } else {
-                notification.showError(context.getString(R.string.error_no_bound_process))
+            // 发送解绑进程请求事件，由 Service 统一处理
+            coroutineScope.launch {
+                FloatingEventBus.emitUIAction(UIActionEvent.UnbindProcessRequest)
             }
         }
 
         binding.btnExitOverlay.setOnClickListener {
-            // Service 需要处理停止
+            // 发送退出悬浮窗请求事件，由 Service 统一处理
+            coroutineScope.launch {
+                FloatingEventBus.emitUIAction(UIActionEvent.ExitOverlayRequest)
+            }
         }
     }
 
     private fun setupMemoryRange() {
         binding.settingMemoryRange.setOnClickListener {
-            showMemoryRangeDialog()
+            // 发送显示内存范围对话框事件，由 Service 统一处理
+            coroutineScope.launch {
+                FloatingEventBus.emitUIAction(UIActionEvent.ShowMemoryRangeDialog)
+            }
         }
         updateMemoryRangeSummary()
     }
@@ -231,7 +244,10 @@ class SettingsController(
             if (fromUser) {
                 val opacity = intValue / 100f
                 mmkv.floatingOpacity = opacity
-                onApplyOpacity()
+                // 发送应用透明度事件
+                coroutineScope.launch {
+                    FloatingEventBus.emitUIAction(UIActionEvent.ApplyOpacityRequest)
+                }
             }
         }
     }
@@ -278,8 +294,14 @@ class SettingsController(
             isChecked = mmkv.topMostLayer
             setOnCheckedChangeListener { _, isChecked ->
                 mmkv.topMostLayer = isChecked
-                val status = context.getString(if (isChecked) R.string.topmost_enabled else R.string.topmost_disabled)
-                notification.showSuccess(context.getString(R.string.success_topmost_changed, status))
+                val status =
+                    context.getString(if (isChecked) R.string.topmost_enabled else R.string.topmost_disabled)
+                notification.showSuccess(
+                    context.getString(
+                        R.string.success_topmost_changed,
+                        status
+                    )
+                )
             }
         }
     }
@@ -294,159 +316,13 @@ class SettingsController(
     }
 
     @SuppressLint("SetTextI18n")
-    fun updateCurrentProcessDisplay(process: DisplayProcessInfo?) {
-        onBoundProcessChanged()
-
-        process?.let { process ->
-            binding.currentProcessName.text = "${process.name} (PID: ${process.pid})"
-            onUpdateTopIcon(process)
-            onUpdateSearchProcessDisplay(process)
+    private fun updateCurrentProcessDisplay(process: DisplayProcessInfo?) {
+        process?.let { proc ->
+            binding.currentProcessName.text = "${proc.name} (PID: ${proc.pid})"
         } ?: run {
-            binding.currentProcessName.text = context.getString(R.string.settings_no_process_selected)
-            onUpdateTopIcon(null)
-            onUpdateSearchProcessDisplay(null)
+            binding.currentProcessName.text =
+                context.getString(R.string.settings_no_process_selected)
         }
-    }
-
-    @SuppressLint("SetTextI18n", "InflateParams")
-    fun showProcessSelectionDialog() {
-        coroutineScope.launch {
-            runCatching {
-                val mmkv = MMKV.defaultMMKV()
-                val filterSystem = mmkv.filterSystemProcess
-                val filterLinux = mmkv.filterLinuxProcess
-
-                // 后台线程处理耗时操作
-                val processList = withContext(Dispatchers.IO) {
-                    WuwaDriver.listProcessesWithInfo()
-                        .filter { process ->
-                            when {
-                                filterSystem && ApplicationUtils.isSystemApp(context, process.uid) -> false
-                                filterLinux && process.uid < 1000 -> false
-                                else -> true
-                            }
-                        }
-                        .map { process ->
-                            when {
-                                process.name.isEmpty() || ApplicationUtils.isSystemApp(context, process.uid) -> {
-                                    DisplayProcessInfo(
-                                        icon = ApplicationUtils.getAndroidIcon(context),
-                                        name = process.name,
-                                        packageName = null,
-                                        pid = process.pid,
-                                        uid = process.uid,
-                                        prio = 1,
-                                        rss = process.rss,
-                                        cmdline = process.name
-                                    )
-                                }
-                                else -> {
-                                    val packageName = process.name.split(":").first()
-                                    var prio = 3
-
-                                    val appIcon = ApplicationUtils.getAppIconByPackageName(context, packageName)
-                                        ?: ApplicationUtils.getAppIconByUid(context, process.uid)
-                                        ?: ApplicationUtils.getAndroidIcon(context).also { prio-- }
-
-                                    val appName = ApplicationUtils.getAppNameByPackageName(context, packageName)
-                                        ?: ApplicationUtils.getAppNameByUid(context, process.uid)
-                                        ?: process.name.also { prio-- }
-
-                                    DisplayProcessInfo(
-                                        icon = appIcon,
-                                        name = appName,
-                                        packageName = packageName,
-                                        pid = process.pid,
-                                        uid = process.uid,
-                                        prio = prio,
-                                        rss = process.rss,
-                                        cmdline = process.name
-                                    )
-                                }
-                            }
-                        }
-                        .sortedByDescending { it.prio }
-                }
-
-                // 回到主线程显示对话框
-                val adapter = ProcessListAdapter(context, processList)
-                context.customDialog(
-                    title = context.getString(R.string.settings_select_process),
-                    adapter = adapter,
-                    onItemClick = { position ->
-                        val selectedProcess = processList[position]
-
-                        runCatching {
-                            val success = WuwaDriver.bindProcess(selectedProcess.pid)
-                            if (!success) {
-                                notification.showError(context.getString(R.string.error_bind_process_failed))
-                                return@customDialog
-                            }
-
-                            if (ProcessDeathMonitor.isMonitoring) {
-                                ProcessDeathMonitor.stop()
-                            }
-                            ProcessDeathMonitor.start(selectedProcess.pid, processDeathCallback)
-                        }.onFailure {
-                            it.printStackTrace()
-                            notification.showError(context.getString(R.string.error_bind_process_failed_with_reason, it.message.orEmpty()))
-                        }.onSuccess {
-                            updateCurrentProcessDisplay(selectedProcess)
-                            notification.showSuccess(context.getString(R.string.success_process_selected, selectedProcess.name))
-                        }
-                    }
-                )
-            }.onFailure {
-                Log.e(TAG, it.stackTraceToString())
-                notification.showError("加载进程列表失败: ${it.message}")
-            }
-        }
-    }
-
-    fun showMemoryRangeDialog() {
-        val mmkv = MMKV.defaultMMKV()
-        val allRanges = MemoryRange.entries.toTypedArray()
-        val selectedRanges = mmkv.selectedMemoryRanges
-        val checkedItems = allRanges.map { selectedRanges.contains(it) }.toBooleanArray()
-
-        // 默认选中的内存范围（与 FloatingConfig 中的默认值一致）
-        val defaultRanges = setOf(
-            MemoryRange.Jh,
-            MemoryRange.Ch,
-            MemoryRange.Ca,
-            MemoryRange.Cd,
-            MemoryRange.Cb,
-            MemoryRange.Ps,
-            MemoryRange.An
-        )
-        val defaultCheckedItems = allRanges.map { defaultRanges.contains(it) }.toBooleanArray()
-
-        val memorySizes = if (WuwaDriver.isProcessBound) runCatching {
-            val regions = WuwaDriver.queryMemRegions()
-                .divideToSimpleMemoryRange()
-            regions.groupBy { it.range }.mapValues { (_, entries) ->
-                entries.sumOf { it.end - it.start }
-            }
-        }.getOrNull() else {
-            null
-        }
-
-        val dialog = MemoryRangeDialog(
-            context = context,
-            memoryRanges = allRanges,
-            checkedItems = checkedItems,
-            memorySizes = memorySizes,
-            defaultCheckedItems = defaultCheckedItems
-        )
-
-        dialog.onMultiChoice = { newCheckedItems ->
-            val newRanges = allRanges.filterIndexed { index, _ -> newCheckedItems[index] }.toSet()
-            mmkv.selectedMemoryRanges = newRanges
-            updateMemoryRangeSummary()
-            notification.showSuccess(context.getString(R.string.success_memory_range_saved))
-        }
-
-        dialog.show()
     }
 
     private fun updateMemoryRangeSummary() {
@@ -457,7 +333,6 @@ class SettingsController(
         } else {
             context.getString(R.string.memory_range_count, selectedRanges.size)
         }
-        onUpdateMemoryRangeSummary()
     }
 
     private fun showSkipMemoryDialog() {
@@ -553,7 +428,8 @@ class SettingsController(
 
     @SuppressLint("SetTextI18n")
     private fun updateMemoryBufferSizeDisplay(sizeMB: Int = MMKV.defaultMMKV().memoryBufferSize) {
-        binding.memoryBufferSizeValue.text = if (sizeMB == 0) context.getString(R.string.memory_empty_region) else "$sizeMB MB"
+        binding.memoryBufferSizeValue.text =
+            if (sizeMB == 0) context.getString(R.string.memory_empty_region) else "$sizeMB MB"
     }
 
     private fun showKeyboardDialog() {
@@ -647,11 +523,6 @@ class SettingsController(
             else -> context.getString(R.string.chunk_size_512_kb)
         }
         binding.chunkSizeValue.text = text
-    }
-
-    fun requestExitOverlay(): Boolean {
-        // 返回 true 表示允许退出
-        return true
     }
 
     override fun cleanup() {

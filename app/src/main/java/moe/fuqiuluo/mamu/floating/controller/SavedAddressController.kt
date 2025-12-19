@@ -8,9 +8,17 @@ import android.widget.TextView
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.SimpleItemAnimator
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.filter
 import moe.fuqiuluo.mamu.R
+import moe.fuqiuluo.mamu.floating.event.AddressValueChangedEvent
+import moe.fuqiuluo.mamu.floating.event.FloatingEventBus
+import moe.fuqiuluo.mamu.floating.event.ProcessStateEvent
+import moe.fuqiuluo.mamu.floating.event.SaveSearchResultsEvent
+import moe.fuqiuluo.mamu.floating.event.SearchResultsUpdatedEvent
 import moe.fuqiuluo.mamu.floating.data.model.SavedAddress
 import moe.fuqiuluo.mamu.databinding.FloatingSavedAddressesLayoutBinding
+import moe.fuqiuluo.mamu.driver.ExactSearchResultItem
+import moe.fuqiuluo.mamu.driver.FuzzySearchResultItem
 import moe.fuqiuluo.mamu.driver.SearchEngine
 import moe.fuqiuluo.mamu.driver.WuwaDriver
 import moe.fuqiuluo.mamu.floating.adapter.SavedAddressAdapter
@@ -33,8 +41,6 @@ class SavedAddressController(
     binding: FloatingSavedAddressesLayoutBinding,
     notification: NotificationOverlay
 ) : FloatingController<FloatingSavedAddressesLayoutBinding>(context, binding, notification) {
-    // 搜索结果更新回调
-    var onSearchResultsUpdated: ((totalCount: Long, ranges: List<DisplayMemRegionEntry>) -> Unit)? = null
     // 保存的地址列表（内存中）
     private val savedAddresses = mutableListOf<SavedAddress>()
 
@@ -68,6 +74,106 @@ class SavedAddressController(
         updateProcessDisplay(null)
         updateEmptyState()
         updateAddressCountBadge()
+        
+        subscribeToAddressEvents()
+        subscribeToProcessStateEvents()
+        subscribeToSaveSearchResultsEvents()
+    }
+
+    /**
+     * 订阅地址值变更事件
+     * 当搜索结果界面修改值时，同步更新保存地址界面的显示
+     */
+    private fun subscribeToAddressEvents() {
+        coroutineScope.launch {
+            FloatingEventBus.addressValueChangedEvents
+                .filter { it.source != AddressValueChangedEvent.Source.SAVED_ADDRESS }
+                .collect { event ->
+                    updateAddressValueByAddress(event.address, event.newValue)
+                }
+        }
+    }
+
+    /**
+     * 订阅进程状态变更事件
+     */
+    private fun subscribeToProcessStateEvents() {
+        coroutineScope.launch {
+            FloatingEventBus.processStateEvents.collect { event ->
+                when (event.type) {
+                    ProcessStateEvent.Type.BOUND -> {
+                        // 绑定新进程时，先清空旧地址再更新显示
+                        clearAll()
+                        updateProcessDisplay(event.process)
+                    }
+                    ProcessStateEvent.Type.UNBOUND,
+                    ProcessStateEvent.Type.DIED -> {
+                        clearAll()
+                        updateProcessDisplay(null)
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 订阅保存搜索结果事件
+     */
+    private fun subscribeToSaveSearchResultsEvents() {
+        coroutineScope.launch {
+            FloatingEventBus.saveSearchResultsEvents.collect { event ->
+                // 将搜索结果转换为 SavedAddress 并保存
+                val savedAddresses = event.selectedItems.mapNotNull { item ->
+                    when (item) {
+                        is ExactSearchResultItem -> {
+                            // 查找对应的内存范围
+                            val range = event.ranges?.find { range ->
+                                item.address >= range.start && item.address < range.end
+                            }?.range ?: return@mapNotNull null
+
+                            SavedAddress(
+                                address = item.address,
+                                name = "Var #${String.format("%X", item.address)}",
+                                valueType = item.valueType,
+                                value = item.value,
+                                isFrozen = false,
+                                range = range
+                            )
+                        }
+
+                        is FuzzySearchResultItem -> {
+                            // 查找对应的内存范围
+                            val range = event.ranges?.find { range ->
+                                item.address >= range.start && item.address < range.end
+                            }?.range ?: return@mapNotNull null
+
+                            SavedAddress(
+                                address = item.address,
+                                name = "Var #${String.format("%X", item.address)}",
+                                valueType = item.valueType,
+                                value = item.value,
+                                isFrozen = false,
+                                range = range
+                            )
+                        }
+
+                        else -> null
+                    }
+                }
+                saveAddresses(savedAddresses)
+            }
+        }
+    }
+
+    /**
+     * 根据地址更新值（用于事件同步）
+     */
+    private fun updateAddressValueByAddress(address: Long, newValue: String) {
+        val index = savedAddresses.indexOfFirst { it.address == address }
+        if (index >= 0) {
+            savedAddresses[index] = savedAddresses[index].copy(value = newValue)
+            adapter.updateAddress(savedAddresses[index])
+        }
     }
 
     fun setAddressCountBadgeView(vararg badges: TextView) {
@@ -230,7 +336,7 @@ class SavedAddressController(
     /**
      * 保存单个地址
      */
-    fun saveAddress(address: SavedAddress) {
+    private fun saveAddress(address: SavedAddress) {
         val existingIndex = savedAddresses.indexOfFirst { it.address == address.address }
         if (existingIndex >= 0) {
             savedAddresses[existingIndex] = address
@@ -246,7 +352,7 @@ class SavedAddressController(
     /**
      * 批量保存地址
      */
-    fun saveAddresses(addresses: List<SavedAddress>) {
+    private fun saveAddresses(addresses: List<SavedAddress>) {
         if (addresses.isEmpty()) {
             return
         }
@@ -414,6 +520,15 @@ class SavedAddressController(
                             savedAddresses[addrIndex] = item.copy(value = newValue)
                             adapter.updateAddress(savedAddresses[addrIndex])
                         }
+                        // 发送事件通知其他界面同步更新
+                        FloatingEventBus.emitAddressValueChanged(
+                            AddressValueChangedEvent(
+                                address = item.address,
+                                newValue = newValue,
+                                valueType = valueType.nativeId,
+                                source = AddressValueChangedEvent.Source.SAVED_ADDRESS
+                            )
+                        )
                         successCount++
                     } else {
                         failureCount++
@@ -495,6 +610,17 @@ class SavedAddressController(
                                 backup.originalType
                             )
                             if (WuwaDriver.writeMemory(item.address, dataBytes)) {
+                                // 发送事件通知其他界面同步更新
+                                withContext(Dispatchers.Main) {
+                                    FloatingEventBus.emitAddressValueChanged(
+                                        AddressValueChangedEvent(
+                                            address = item.address,
+                                            newValue = backup.originalValue,
+                                            valueType = backup.originalType.nativeId,
+                                            source = AddressValueChangedEvent.Source.SAVED_ADDRESS
+                                        )
+                                    )
+                                }
                                 MemoryBackupManager.removeBackup(item.address)
                                 restoreCount++
                             } else {
@@ -603,6 +729,15 @@ class SavedAddressController(
                                             item.copy(value = backup.originalValue)
                                         adapter.updateAddress(savedAddresses[index])
                                     }
+                                    // 发送事件通知其他界面同步更新
+                                    FloatingEventBus.emitAddressValueChanged(
+                                        AddressValueChangedEvent(
+                                            address = item.address,
+                                            newValue = backup.originalValue,
+                                            valueType = backup.originalType.nativeId,
+                                            source = AddressValueChangedEvent.Source.SAVED_ADDRESS
+                                        )
+                                    )
                                 }
                                 MemoryBackupManager.removeBackup(item.address)
                                 restoreCount++
@@ -713,7 +848,12 @@ class SavedAddressController(
                     )
                 }
 
-                onSearchResultsUpdated?.invoke(totalCount, ranges)
+                // 发送搜索结果更新事件
+                coroutineScope.launch {
+                    FloatingEventBus.emitSearchResultsUpdated(
+                        SearchResultsUpdatedEvent(totalCount, ranges)
+                    )
+                }
             } else {
                 notification.showError("设置搜索结果失败")
             }

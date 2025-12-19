@@ -33,12 +33,34 @@ import moe.fuqiuluo.mamu.driver.ExactSearchResultItem
 import moe.fuqiuluo.mamu.driver.FuzzySearchResultItem
 import moe.fuqiuluo.mamu.driver.ProcessDeathMonitor
 import moe.fuqiuluo.mamu.driver.WuwaDriver
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import moe.fuqiuluo.mamu.data.settings.filterLinuxProcess
+import moe.fuqiuluo.mamu.data.settings.filterSystemProcess
+import moe.fuqiuluo.mamu.floating.adapter.ProcessListAdapter
+import moe.fuqiuluo.mamu.floating.dialog.MemoryRangeDialog
+import moe.fuqiuluo.mamu.floating.dialog.customDialog
+import moe.fuqiuluo.mamu.utils.ApplicationUtils
+import moe.fuqiuluo.mamu.utils.RootConfigManager
+import moe.fuqiuluo.mamu.utils.RootShellExecutor
+import moe.fuqiuluo.mamu.utils.onError
+import moe.fuqiuluo.mamu.utils.onSuccess
 import moe.fuqiuluo.mamu.floating.FloatingWindowStateManager
+import moe.fuqiuluo.mamu.floating.event.FloatingEventBus
+import moe.fuqiuluo.mamu.floating.event.MemoryRangeChangedEvent
+import moe.fuqiuluo.mamu.floating.event.ProcessStateEvent
+import moe.fuqiuluo.mamu.floating.event.UIActionEvent
 import moe.fuqiuluo.mamu.data.settings.selectedMemoryRanges
 import moe.fuqiuluo.mamu.data.settings.tabSwitchAnimation
 import moe.fuqiuluo.mamu.data.settings.topMostLayer
 import moe.fuqiuluo.mamu.floating.controller.*
+import moe.fuqiuluo.mamu.floating.data.model.MemoryRange
 import moe.fuqiuluo.mamu.floating.ext.applyOpacity
+import moe.fuqiuluo.mamu.floating.ext.divideToSimpleMemoryRange
 import moe.fuqiuluo.mamu.floating.listener.DraggableFloatingIconTouchListener
 import moe.fuqiuluo.mamu.floating.data.model.DisplayProcessInfo
 import moe.fuqiuluo.mamu.widget.*
@@ -48,6 +70,9 @@ private const val NOTIFICATION_ID = 1001
 private const val CHANNEL_ID = "floating_window_service"
 
 class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
+    // 协程作用域
+    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+
     // 窗口管理器
     private lateinit var windowManager: WindowManager
 
@@ -127,8 +152,10 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
         // 创建带有 Material Components 主题的 Context
         val themedContext = ContextThemeWrapper(this, R.style.Theme_MX)
 
-        floatingIconBinding = FloatingWindowLayoutBinding.inflate(LayoutInflater.from(themedContext))
-        fullscreenBinding = FloatingFullscreenLayoutBinding.inflate(LayoutInflater.from(themedContext))
+        floatingIconBinding =
+            FloatingWindowLayoutBinding.inflate(LayoutInflater.from(themedContext))
+        fullscreenBinding =
+            FloatingFullscreenLayoutBinding.inflate(LayoutInflater.from(themedContext))
 
         setupFloatingIcon()
         setupFullscreenView()
@@ -139,9 +166,323 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
         }
 
         initializeControllers()
+        subscribeToUIActionEvents()
+        subscribeToMemoryRangeChangedEvents()
+        subscribeToProcessStateEvents()
 
         // 通知悬浮窗已启动
         FloatingWindowStateManager.setActive(true)
+    }
+
+    /**
+     * 订阅 UI 操作请求事件
+     */
+    private fun subscribeToUIActionEvents() {
+        coroutineScope.launch {
+            FloatingEventBus.uiActionEvents.collect { event ->
+                when (event) {
+                    is UIActionEvent.ShowProcessSelectionDialog -> {
+                        showProcessSelectionDialog()
+                    }
+                    is UIActionEvent.BindProcessRequest -> {
+                        handleBindProcess(event.process)
+                    }
+                    is UIActionEvent.UnbindProcessRequest -> {
+                        handleUnbindProcess(isUserInitiated = true)
+                    }
+                    is UIActionEvent.ExitOverlayRequest -> {
+                        stopSelf()
+                    }
+                    is UIActionEvent.ShowMemoryRangeDialog -> {
+                        showMemoryRangeDialog()
+                    }
+                    is UIActionEvent.ApplyOpacityRequest -> {
+                        fullscreenBinding.applyOpacity()
+                    }
+                    is UIActionEvent.HideFloatingWindow -> {
+                        hideFullscreen()
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 订阅内存范围配置变更事件
+     */
+    private fun subscribeToMemoryRangeChangedEvents() {
+        coroutineScope.launch {
+            FloatingEventBus.memoryRangeChangedEvents.collect {
+                updateBottomInfoBar()
+            }
+        }
+    }
+
+    /**
+     * 订阅进程状态变更事件（用于更新顶部图标）
+     */
+    private fun subscribeToProcessStateEvents() {
+        coroutineScope.launch {
+            FloatingEventBus.processStateEvents.collect { event ->
+                when (event.type) {
+                    ProcessStateEvent.Type.BOUND -> {
+                        updateTopIcon(event.process)
+                    }
+                    ProcessStateEvent.Type.UNBOUND,
+                    ProcessStateEvent.Type.DIED -> {
+                        updateTopIcon(null)
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 处理进程绑定请求
+     */
+    private fun handleBindProcess(process: DisplayProcessInfo) {
+        // 如果当前有绑定的进程，先解绑
+        if (WuwaDriver.isProcessBound) {
+            WuwaDriver.unbindProcess()
+            ProcessDeathMonitor.stop()
+        }
+
+        runCatching {
+            val success = WuwaDriver.bindProcess(process.pid)
+            if (!success) {
+                notification.showError(getString(R.string.error_bind_process_failed))
+                return
+            }
+
+            // 启动进程死亡监控
+            ProcessDeathMonitor.start(process.pid, this)
+        }.onFailure {
+            it.printStackTrace()
+            notification.showError(
+                getString(R.string.error_bind_process_failed_with_reason, it.message.orEmpty())
+            )
+        }.onSuccess {
+            notification.showSuccess(getString(R.string.success_process_selected, process.name))
+
+            // 发布进程绑定成功事件
+            coroutineScope.launch {
+                FloatingEventBus.emitProcessState(
+                    ProcessStateEvent(ProcessStateEvent.Type.BOUND, process)
+                )
+            }
+        }
+    }
+
+    /**
+     * 处理进程解绑
+     * @param isUserInitiated 是否由用户主动触发（终止进程按钮）
+     */
+    private fun handleUnbindProcess(isUserInitiated: Boolean) {
+        if (!WuwaDriver.isProcessBound) {
+            if (isUserInitiated) {
+                notification.showError(getString(R.string.error_no_bound_process))
+            }
+            return
+        }
+
+        val pid = WuwaDriver.currentBindPid
+
+        if (isUserInitiated) {
+            // 用户主动终止进程
+            RootShellExecutor.exec(
+                suCmd = RootConfigManager.getCustomRootCommand(),
+                "kill -9 $pid",
+                1000
+            ).onSuccess {
+                notification.showSuccess(getString(R.string.success_process_terminated))
+            }.onError {
+                notification.showError(getString(R.string.error_terminate_failed))
+            }
+        }
+
+        WuwaDriver.unbindProcess()
+        ProcessDeathMonitor.stop()
+
+        // 发布进程解绑事件
+        coroutineScope.launch {
+            FloatingEventBus.emitProcessState(
+                ProcessStateEvent(ProcessStateEvent.Type.UNBOUND, null)
+            )
+        }
+    }
+
+    /**
+     * 处理进程死亡
+     */
+    private fun handleProcessDied(pid: Int) {
+        notification.showError(getString(R.string.error_process_died, pid))
+
+        if (WuwaDriver.isProcessBound) {
+            WuwaDriver.unbindProcess()
+        }
+        ProcessDeathMonitor.stop()
+
+        // 发布进程死亡事件
+        coroutineScope.launch {
+            FloatingEventBus.emitProcessState(
+                ProcessStateEvent(ProcessStateEvent.Type.DIED, null)
+            )
+        }
+    }
+
+    /**
+     * 显示进程选择对话框
+     */
+    @SuppressLint("SetTextI18n")
+    private fun showProcessSelectionDialog() {
+        coroutineScope.launch {
+            runCatching {
+                val mmkv = MMKV.defaultMMKV()
+                val filterSystem = mmkv.filterSystemProcess
+                val filterLinux = mmkv.filterLinuxProcess
+
+                val processList = withContext(Dispatchers.IO) {
+                    WuwaDriver.listProcessesWithInfo()
+                        .filter { process ->
+                            when {
+                                filterSystem && ApplicationUtils.isSystemApp(
+                                    this@FloatingWindowService,
+                                    process.uid
+                                ) -> false
+
+                                filterLinux && process.uid < 1000 -> false
+                                else -> true
+                            }
+                        }
+                        .map { process ->
+                            when {
+                                process.name.isEmpty() || ApplicationUtils.isSystemApp(
+                                    this@FloatingWindowService,
+                                    process.uid
+                                ) -> {
+                                    DisplayProcessInfo(
+                                        icon = ApplicationUtils.getAndroidIcon(this@FloatingWindowService),
+                                        name = process.name,
+                                        packageName = null,
+                                        pid = process.pid,
+                                        uid = process.uid,
+                                        prio = 1,
+                                        rss = process.rss,
+                                        cmdline = process.name
+                                    )
+                                }
+
+                                else -> {
+                                    val packageName = process.name.split(":").first()
+                                    var prio = 3
+
+                                    val appIcon = ApplicationUtils.getAppIconByPackageName(
+                                        this@FloatingWindowService,
+                                        packageName
+                                    )
+                                        ?: ApplicationUtils.getAppIconByUid(
+                                            this@FloatingWindowService,
+                                            process.uid
+                                        )
+                                        ?: ApplicationUtils.getAndroidIcon(this@FloatingWindowService)
+                                            .also { prio-- }
+
+                                    val appName = ApplicationUtils.getAppNameByPackageName(
+                                        this@FloatingWindowService,
+                                        packageName
+                                    )
+                                        ?: ApplicationUtils.getAppNameByUid(
+                                            this@FloatingWindowService,
+                                            process.uid
+                                        )
+                                        ?: process.name.also { prio-- }
+
+                                    DisplayProcessInfo(
+                                        icon = appIcon,
+                                        name = appName,
+                                        packageName = packageName,
+                                        pid = process.pid,
+                                        uid = process.uid,
+                                        prio = prio,
+                                        rss = process.rss,
+                                        cmdline = process.name
+                                    )
+                                }
+                            }
+                        }
+                        .sortedByDescending { it.prio }
+                }
+
+                val adapter = ProcessListAdapter(this@FloatingWindowService, processList)
+                this@FloatingWindowService.customDialog(
+                    title = getString(R.string.settings_select_process),
+                    adapter = adapter,
+                    onItemClick = { position ->
+                        val selectedProcess = processList[position]
+                        // 发送绑定进程请求事件，由 Service 统一处理绑定逻辑
+                        coroutineScope.launch {
+                            FloatingEventBus.emitUIAction(UIActionEvent.BindProcessRequest(selectedProcess))
+                        }
+                    }
+                )
+            }.onFailure {
+                Log.e(TAG, it.stackTraceToString())
+                notification.showError("加载进程列表失败: ${it.message}")
+            }
+        }
+    }
+
+    /**
+     * 显示内存范围选择对话框
+     */
+    private fun showMemoryRangeDialog() {
+        val mmkv = MMKV.defaultMMKV()
+        val allRanges = MemoryRange.entries.toTypedArray()
+        val selectedRanges = mmkv.selectedMemoryRanges
+        val checkedItems = allRanges.map { selectedRanges.contains(it) }.toBooleanArray()
+
+        // 默认选中的内存范围
+        val defaultRanges = setOf(
+            MemoryRange.Jh,
+            MemoryRange.Ch,
+            MemoryRange.Ca,
+            MemoryRange.Cd,
+            MemoryRange.Cb,
+            MemoryRange.Ps,
+            MemoryRange.An
+        )
+        val defaultCheckedItems = allRanges.map { defaultRanges.contains(it) }.toBooleanArray()
+
+        val memorySizes = if (WuwaDriver.isProcessBound) runCatching {
+            val regions = WuwaDriver.queryMemRegions()
+                .divideToSimpleMemoryRange()
+            regions.groupBy { it.range }.mapValues { (_, entries) ->
+                entries.sumOf { it.end - it.start }
+            }
+        }.getOrNull() else {
+            null
+        }
+
+        val dialog = MemoryRangeDialog(
+            context = this,
+            memoryRanges = allRanges,
+            checkedItems = checkedItems,
+            memorySizes = memorySizes,
+            defaultCheckedItems = defaultCheckedItems
+        )
+
+        dialog.onMultiChoice = { newCheckedItems ->
+            val newRanges = allRanges.filterIndexed { index, _ -> newCheckedItems[index] }.toSet()
+            mmkv.selectedMemoryRanges = newRanges
+            notification.showSuccess(getString(R.string.success_memory_range_saved))
+
+            // 发送内存范围变更事件
+            coroutineScope.launch {
+                FloatingEventBus.emitMemoryRangeChanged()
+            }
+        }
+
+        dialog.show()
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -165,7 +506,7 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
             layoutFlag,
             // 启用硬件加速以提升渲染性能
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+                    WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
             PixelFormat.TRANSLUCENT
         )
 
@@ -228,7 +569,7 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
             layoutFlag,
             // 启用硬件加速以提升渲染性能
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+                    WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
             PixelFormat.TRANSLUCENT
         )
 
@@ -272,7 +613,7 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
     private fun setupTopBar() {
         // 顶部工具栏（竖屏）
         fullscreenBinding.attachedAppIcon.setOnClickListener {
-            settingsController.showProcessSelectionDialog()
+            showProcessSelectionDialog()
         }
 
         fullscreenBinding.btnCloseFullscreen.setOnClickListener {
@@ -301,7 +642,7 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
 
         // 侧边栏（横屏）
         fullscreenBinding.sidebarAppIcon.setOnClickListener {
-            settingsController.showProcessSelectionDialog()
+            showProcessSelectionDialog()
         }
 
         fullscreenBinding.sidebarBtnClose.setOnClickListener {
@@ -347,79 +688,13 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
             context = this,
             binding = fullscreenBinding.contentSearch,
             notification = notification,
-            onShowSearchDialog = {
-                val clipboardManager = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
-                searchController.showSearchDialog(clipboardManager)
-            },
-            onSaveSelectedAddresses = { selectedItems ->
-                // 将搜索结果转换为 SavedAddress 并保存
-                val ranges = searchController.getRanges()
-                val savedAddresses = selectedItems.mapNotNull { item ->
-                    when (item) {
-                        is ExactSearchResultItem -> {
-                            // 查找对应的内存范围
-                            val range = ranges?.find { range ->
-                                item.address >= range.start && item.address < range.end
-                            }?.range ?: return@mapNotNull null
-
-                            SavedAddress(
-                                address = item.address,
-                                name = "Var #${String.format("%X", item.address)}",
-                                valueType = item.valueType,
-                                value = item.value,
-                                isFrozen = false,
-                                range = range
-                            )
-                        }
-                        is FuzzySearchResultItem -> {
-                            // 查找对应的内存范围
-                            val range = ranges?.find { range ->
-                                item.address >= range.start && item.address < range.end
-                            }?.range ?: return@mapNotNull null
-
-                            SavedAddress(
-                                address = item.address,
-                                name = "Var #${String.format("%X", item.address)}",
-                                valueType = item.valueType,
-                                value = item.value,
-                                isFrozen = false,
-                                range = range
-                            )
-                        }
-                        else -> null
-                    }
-                }
-                savedAddressController.saveAddresses(savedAddresses)
-            },
-            onExitFullscreen = {
-                // 退出全屏：隐藏搜索进度对话框但保持搜索状态
-                hideFullscreen() // SearchController called
-            }
+            clipboardManager = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager,
         )
-
-        // 设置保存地址控制器的搜索结果更新回调
-        savedAddressController.onSearchResultsUpdated = { totalCount, ranges ->
-            searchController.onResultsFromSavedAddresses(totalCount, ranges)
-        }
 
         settingsController = SettingsController(
             context = this,
             binding = fullscreenBinding.contentSettings,
-            notification = notification,
-            packageManager = packageManager,
-            onUpdateTopIcon = ::updateTopIcon,
-            onUpdateSearchProcessDisplay = {
-                searchController.updateSearchProcessDisplay(it)
-                savedAddressController.updateProcessDisplay(it)
-            },
-            onUpdateMemoryRangeSummary = ::updateBottomInfoBar,
-            onApplyOpacity = { fullscreenBinding.applyOpacity() },
-            processDeathCallback = this,
-            onBoundProcessChanged = {
-                // 绑定的进程改变，无效化
-                searchController.clearSearchResults()
-                savedAddressController.clearAll()
-            }
+            notification = notification
         )
 
         memoryPreviewController = MemoryPreviewController(
@@ -440,20 +715,16 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
         savedAddressController.initialize()
         memoryPreviewController.initialize()
         breakpointController.initialize()
-
-        // 处理退出按钮
-        fullscreenBinding.contentSettings.btnExitOverlay.setOnClickListener {
-            if (settingsController.requestExitOverlay()) {
-                stopSelf()
-            }
-        }
     }
 
     private fun initializeBottomInfoBar() {
         updateBottomInfoBar()
 
         fullscreenBinding.tvSelectedMemoryRanges.setOnClickListener {
-            settingsController.showMemoryRangeDialog()
+            // 发送显示内存范围对话框事件
+            coroutineScope.launch {
+                FloatingEventBus.emitUIAction(UIActionEvent.ShowMemoryRangeDialog)
+            }
         }
     }
 
@@ -491,34 +762,45 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
 
         // 更新内容区域的约束
         val contentContainer = fullscreenBinding.contentContainer
-        val layoutParams = contentContainer.layoutParams as androidx.constraintlayout.widget.ConstraintLayout.LayoutParams
+        val layoutParams =
+            contentContainer.layoutParams as androidx.constraintlayout.widget.ConstraintLayout.LayoutParams
 
         if (isLandscape) {
             // 横屏：内容区域从侧边栏右侧开始
-            layoutParams.topToBottom = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.UNSET
-            layoutParams.topToTop = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.PARENT_ID
+            layoutParams.topToBottom =
+                androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.UNSET
+            layoutParams.topToTop =
+                androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.PARENT_ID
             layoutParams.startToEnd = R.id.sidebar_container
-            layoutParams.startToStart = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.UNSET
+            layoutParams.startToStart =
+                androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.UNSET
         } else {
             // 竖屏：内容区域从顶部工具栏下方开始
             layoutParams.topToBottom = R.id.toolbar_container
-            layoutParams.topToTop = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.UNSET
-            layoutParams.startToEnd = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.UNSET
-            layoutParams.startToStart = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.PARENT_ID
+            layoutParams.topToTop =
+                androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.UNSET
+            layoutParams.startToEnd =
+                androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.UNSET
+            layoutParams.startToStart =
+                androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.PARENT_ID
         }
 
         contentContainer.layoutParams = layoutParams
 
         // 更新底部信息栏的约束
         val bottomInfoBar = fullscreenBinding.bottomInfoBar
-        val bottomLayoutParams = bottomInfoBar.layoutParams as androidx.constraintlayout.widget.ConstraintLayout.LayoutParams
+        val bottomLayoutParams =
+            bottomInfoBar.layoutParams as androidx.constraintlayout.widget.ConstraintLayout.LayoutParams
 
         if (isLandscape) {
             bottomLayoutParams.startToEnd = R.id.sidebar_container
-            bottomLayoutParams.startToStart = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.UNSET
+            bottomLayoutParams.startToStart =
+                androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.UNSET
         } else {
-            bottomLayoutParams.startToEnd = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.UNSET
-            bottomLayoutParams.startToStart = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.PARENT_ID
+            bottomLayoutParams.startToEnd =
+                androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.UNSET
+            bottomLayoutParams.startToStart =
+                androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.PARENT_ID
         }
 
         bottomInfoBar.layoutParams = bottomLayoutParams
@@ -613,6 +895,9 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
         memoryPreviewController.cleanup()
         breakpointController.cleanup()
 
+        // 取消协程
+        coroutineScope.cancel()
+
         // 通知悬浮窗已关闭
         FloatingWindowStateManager.setActive(false)
     }
@@ -669,7 +954,8 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
                 }
             } else {
                 allIndicators.forEach { (indicatorId, indicator) ->
-                    indicator.visibility = if (indicatorId == activeIndicatorId) View.VISIBLE else View.GONE
+                    indicator.visibility =
+                        if (indicatorId == activeIndicatorId) View.VISIBLE else View.GONE
                 }
             }
         }
@@ -791,14 +1077,7 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
     }
 
     override fun onProcessDied(pid: Int) {
-        notification.showError(getString(R.string.error_process_died, pid))
-
-        if (WuwaDriver.isProcessBound) {
-            WuwaDriver.unbindProcess()
-        }
-        ProcessDeathMonitor.stop()
-
-        settingsController.updateCurrentProcessDisplay(null)
+        handleProcessDied(pid)
     }
 
     private fun dp(value: Int): Int =

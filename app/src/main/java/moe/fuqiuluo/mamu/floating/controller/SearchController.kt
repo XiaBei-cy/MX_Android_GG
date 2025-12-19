@@ -8,7 +8,13 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.SimpleItemAnimator
 import com.tencent.mmkv.MMKV
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.filter
 import moe.fuqiuluo.mamu.R
+import moe.fuqiuluo.mamu.floating.event.AddressValueChangedEvent
+import moe.fuqiuluo.mamu.floating.event.FloatingEventBus
+import moe.fuqiuluo.mamu.floating.event.ProcessStateEvent
+import moe.fuqiuluo.mamu.floating.event.SaveSearchResultsEvent
+import moe.fuqiuluo.mamu.floating.event.SearchResultsUpdatedEvent
 import moe.fuqiuluo.mamu.databinding.FloatingSearchLayoutBinding
 import moe.fuqiuluo.mamu.driver.ExactSearchResultItem
 import moe.fuqiuluo.mamu.driver.FuzzySearchResultItem
@@ -39,9 +45,7 @@ class SearchController(
     context: Context,
     binding: FloatingSearchLayoutBinding,
     notification: NotificationOverlay,
-    private val onShowSearchDialog: () -> Unit,
-    private val onSaveSelectedAddresses: ((List<SearchResultItem>) -> Unit)? = null,
-    private val onExitFullscreen: (() -> Unit)? = null
+    private val clipboardManager: ClipboardManager
 ) : FloatingController<FloatingSearchLayoutBinding>(context, binding, notification) {
     // 搜索结果列表适配器
     private lateinit var searchResultAdapter: SearchResultAdapter
@@ -64,6 +68,69 @@ class SearchController(
         updateSearchResultCount(0, null)
         updateFilterStatusUI()
         showEmptyState(true)
+        subscribeToAddressEvents()
+        subscribeToProcessStateEvents()
+        subscribeToSearchResultsUpdatedEvents()
+    }
+
+    /**
+     * 订阅地址值变更事件
+     * 当保存地址界面修改值时，同步更新搜索结果界面的显示
+     */
+    private fun subscribeToAddressEvents() {
+        coroutineScope.launch {
+            FloatingEventBus.addressValueChangedEvents
+                .filter { it.source != AddressValueChangedEvent.Source.SEARCH }
+                .collect { event ->
+                    searchResultAdapter.updateItemValueByAddress(event.address, event.newValue)
+                }
+        }
+    }
+
+    /**
+     * 订阅进程状态变更事件
+     */
+    private fun subscribeToProcessStateEvents() {
+        coroutineScope.launch {
+            FloatingEventBus.processStateEvents.collect { event ->
+                when (event.type) {
+                    ProcessStateEvent.Type.BOUND -> {
+                        // 绑定新进程时，先清理旧数据再更新显示
+                        clearSearchResults()
+                        updateSearchProcessDisplay(event.process)
+                    }
+                    ProcessStateEvent.Type.UNBOUND,
+                    ProcessStateEvent.Type.DIED -> {
+                        clearSearchResults()
+                        updateSearchProcessDisplay(null)
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 订阅搜索结果更新事件（从保存地址界面搜索后）
+     */
+    private fun subscribeToSearchResultsUpdatedEvents() {
+        coroutineScope.launch {
+            FloatingEventBus.searchResultsUpdatedEvents.collect { event ->
+                val totalCount = event.totalCount.toInt()
+
+                val mmkv = MMKV.defaultMMKV()
+                if (totalCount > 0) {
+                    val itemCountPerPage = mmkv.searchPageSize
+                    val limit = itemCountPerPage.coerceAtMost(totalCount)
+                    updateSearchResultCount(limit, totalCount)
+                    searchResultAdapter.setRanges(event.ranges)
+                    loadSearchResults(limit = limit)
+                } else {
+                    searchResultAdapter.clearResults()
+                    updateSearchResultCount(0, null)
+                    showEmptyState(true)
+                }
+            }
+        }
     }
 
     private fun setupToolbar() {
@@ -116,7 +183,7 @@ class SearchController(
                 icon = R.drawable.icon_search_24px,
                 label = "搜索数据"
             ) {
-                onShowSearchDialog()
+                showSearchDialog(clipboardManager)
             },
             ToolbarAction(
                 id = 7,
@@ -321,32 +388,12 @@ class SearchController(
         }
     }
 
-    /**
-     * 从保存地址设置搜索结果后刷新 UI
-     */
-    fun onResultsFromSavedAddresses(totalFound: Long, ranges: List<DisplayMemRegionEntry>) {
-        val totalCount = totalFound.toInt()
-
-        val mmkv = MMKV.defaultMMKV()
-        if (totalCount > 0) {
-            val itemCountPerPage = mmkv.searchPageSize
-            val limit = itemCountPerPage.coerceAtMost(totalCount)
-            updateSearchResultCount(limit, totalCount)
-            searchResultAdapter.setRanges(ranges)
-            loadSearchResults(limit = limit)
-        } else {
-            searchResultAdapter.clearResults()
-            updateSearchResultCount(0, null)
-            showEmptyState(true)
-        }
-    }
-
     private fun showEmptyState(show: Boolean) {
         binding.emptyStateView.visibility = if (show) View.VISIBLE else View.GONE
         binding.resultsRecyclerView.visibility = if (show) View.GONE else View.VISIBLE
     }
 
-    fun showSearchDialog(clipboardManager: ClipboardManager) {
+    private fun showSearchDialog(clipboardManager: ClipboardManager) {
         if (!WuwaDriver.isProcessBound) {
             notification.showError("请先选择进程")
             return
@@ -371,10 +418,7 @@ class SearchController(
                     onRefineCompleted(totalFound)
                     allSearchComplete()
                 }
-            ).apply {
-                // 设置退出全屏回调
-                onExitFullscreen = this@SearchController.onExitFullscreen
-            }
+            )
         }
         searchDialog?.show()
     }
@@ -564,6 +608,15 @@ class SearchController(
                                     address,
                                     backup.originalValue
                                 )
+                                // 发送事件通知其他界面同步更新
+                                FloatingEventBus.emitAddressValueChanged(
+                                    AddressValueChangedEvent(
+                                        address = address,
+                                        newValue = backup.originalValue,
+                                        valueType = backup.originalType.nativeId,
+                                        source = AddressValueChangedEvent.Source.SEARCH
+                                    )
+                                )
                             }
 
                             // 恢复成功后删除备份记录
@@ -684,7 +737,7 @@ class SearchController(
         }
     }
 
-    fun clearSearchResults() {
+    private fun clearSearchResults() {
         coroutineScope.launch {
             withContext(Dispatchers.IO) {
                 SearchEngine.clearSearchResults()
@@ -695,7 +748,7 @@ class SearchController(
         }
     }
 
-    fun getRanges(): List<DisplayMemRegionEntry>? {
+    private fun getRanges(): List<DisplayMemRegionEntry>? {
         return searchResultAdapter.getRanges()
     }
 
@@ -706,7 +759,15 @@ class SearchController(
             return
         }
 
-        onSaveSelectedAddresses?.invoke(selectedItems)
+        // 发送保存搜索结果事件（包含 ranges 信息）
+        coroutineScope.launch {
+            FloatingEventBus.emitSaveSearchResults(
+                SaveSearchResultsEvent(
+                    selectedItems = selectedItems,
+                    ranges = getRanges()
+                )
+            )
+        }
     }
 
     private fun showModifyValueDialog(result: SearchResultItem) {
@@ -734,6 +795,18 @@ class SearchController(
                     if (success) {
                         // ViewHolder will automatically display backup value if exists
                         searchResultAdapter.updateItemValueByAddress(address, newValue)
+
+                        // 发送事件通知其他界面同步更新
+                        coroutineScope.launch {
+                            FloatingEventBus.emitAddressValueChanged(
+                                AddressValueChangedEvent(
+                                    address = address,
+                                    newValue = newValue,
+                                    valueType = valueType.nativeId,
+                                    source = AddressValueChangedEvent.Source.SEARCH
+                                )
+                            )
+                        }
 
                         notification.showSuccess(
                             context.getString(
@@ -824,6 +897,15 @@ class SearchController(
                                         searchResultAdapter.updateItemValueByAddress(
                                             address,
                                             newValue
+                                        )
+                                        // 发送事件通知其他界面同步更新
+                                        FloatingEventBus.emitAddressValueChanged(
+                                            AddressValueChangedEvent(
+                                                address = address,
+                                                newValue = newValue,
+                                                valueType = valueType.nativeId,
+                                                source = AddressValueChangedEvent.Source.SEARCH
+                                            )
                                         )
                                     }
                                     successCount++
