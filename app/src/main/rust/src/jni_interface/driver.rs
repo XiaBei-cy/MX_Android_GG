@@ -5,13 +5,14 @@ use crate::ext::jni::{JniResult, JniResultExt};
 use crate::wuwa::{WuWaDriver, WuwaMemRegionEntry};
 use anyhow::anyhow;
 use jni::JNIEnv;
-use jni::objects::{JByteArray, JClass, JIntArray, JLongArray, JObject, JObjectArray};
+use jni::objects::{JByteArray, JClass, JIntArray, JLongArray, JObject, JObjectArray, JString};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jsize, jlongArray, jintArray, jobjectArray};
 use jni_macro::jni_method;
 use log::{debug, error, info, log_enabled, Level};
 use nix::libc::close;
 use nix::sys::mman::{MapFlags, ProtFlags, mmap, munmap};
 use obfstr::obfstr as s;
+use obfstr::obfstring as ss;
 use std::num::NonZeroUsize;
 use std::os::fd::BorrowedFd;
 
@@ -610,6 +611,37 @@ pub fn jni_batch_write_memory<'l>(
             .map_err(|e| anyhow!("Failed to set boolean array region: {}", e))?;
 
         Ok(result_array.into())
+    })()
+        .or_throw(&mut env)
+}
+
+#[jni_method(
+    90,
+    "moe/fuqiuluo/mamu/driver/WuwaDriver",
+    "nativeAllowBindProc",
+    "(Ljava/lang/String;)Z"
+)]
+pub fn jni_allow_bind_proc<'l>(mut env: JNIEnv<'l>, _obj: JObject, package: JString) -> jboolean {
+    (|| -> JniResult<jboolean> {
+        let package = env.get_string(&package)?;
+        let package = package.to_str()?;
+        let black_list = [
+            ss!("me.ele"),
+            ss!("com.eg.android.AlipayGphone"),
+            ss!("com.taobao.taobao"),
+            ss!("com.sdu.didi.psnger"),
+            ss!("com.autonavi.minimap"),
+            ss!("com.sankuai.meituan.takeoutnew"),
+            ss!("artd"),
+            ss!("logd"),
+            ss!("traced"),
+        ];
+        for black_package in black_list {
+            if package.contains(&black_package) {
+                return Ok(JNI_FALSE) // 黑名单应用禁止绑定
+            }
+        }
+        Ok(JNI_TRUE)
     })()
         .or_throw(&mut env)
 }

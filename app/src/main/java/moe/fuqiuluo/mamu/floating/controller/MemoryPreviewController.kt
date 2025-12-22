@@ -454,12 +454,12 @@ class MemoryPreviewController(
 //            )
 
                 val memoryData = memoryDeferred.await()
-                Log.d(
-                    TAG,
-                    "[4] 读取内存: 地址=0x${
-                        pageStartAddress.toString(16).uppercase()
-                    }, 大小=${memoryData?.size ?: 0}bytes, 结果=${if (memoryData != null) "成功" else "失败(null)"}"
-                )
+//                Log.d(
+//                    TAG,
+//                    "[4] 读取内存: 地址=0x${
+//                        pageStartAddress.toString(16).uppercase()
+//                    }, 大小=${memoryData?.size ?: 0}bytes, 结果=${if (memoryData != null) "成功" else "失败(null)"}"
+//                )
 
                 // 构建最终列表
                 val items = mutableListOf<MemoryPreviewItem>()
@@ -474,12 +474,12 @@ class MemoryPreviewController(
 
                 if (memoryData == null) {
                     // 内存读取失败，显示占位符
-                    Log.w(
-                        TAG,
-                        "内存读取失败: pageStartAddress=0x${
-                            pageStartAddress.toString(16).uppercase()
-                        }, 进程=${WuwaDriver.currentBindPid}"
-                    )
+//                    Log.w(
+//                        TAG,
+//                        "内存读取失败: pageStartAddress=0x${
+//                            pageStartAddress.toString(16).uppercase()
+//                        }, 进程=${WuwaDriver.currentBindPid}"
+//                    )
                     withContext(Dispatchers.Main) {
                         notification.showError(
                             "内存读取失败: 地址 0x${

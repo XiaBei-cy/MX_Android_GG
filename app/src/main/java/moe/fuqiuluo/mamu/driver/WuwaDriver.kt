@@ -109,6 +109,13 @@ object WuwaDriver {
      */
     fun isDriverInstalled(): Boolean = nativeIsDriverInstalled()
 
+    /**
+     * 是否允许绑定进程
+     * @param packageName 进程包名
+     * @return 是否允许
+     */
+    fun isAllowedBindProc(packageName: String) = nativeAllowBindProc(packageName)
+
     private external fun nativeIsLoaded(): Boolean
     private external fun nativeSetDriverFd(fd: Int): Boolean
     private external fun nativeSetMemoryAccessMode(mode: Int)
@@ -132,4 +139,5 @@ object WuwaDriver {
     private external fun nativeGetAvailableDrivers(): Array<DriverInfo>
     private external fun nativeDownloadAndInstallDriver(driverName: String): DriverInstallResult
     private external fun nativeIsDriverInstalled(): Boolean
+    private external fun nativeAllowBindProc(packageName: String): Boolean
 }

@@ -12,53 +12,53 @@ import android.content.res.Configuration
 import android.graphics.PixelFormat
 import android.os.Build
 import android.os.IBinder
-import androidx.core.app.NotificationCompat
 import android.text.SpannableString
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
 import android.util.Log
 import android.view.*
-import androidx.appcompat.view.ContextThemeWrapper
 import android.view.animation.AccelerateDecelerateInterpolator
 import android.view.animation.AlphaAnimation
 import android.widget.*
+import androidx.appcompat.view.ContextThemeWrapper
+import androidx.core.app.NotificationCompat
 import androidx.core.view.isVisible
 import com.tencent.mmkv.MMKV
-import moe.fuqiuluo.mamu.MainActivity
-import moe.fuqiuluo.mamu.R
-import moe.fuqiuluo.mamu.databinding.FloatingFullscreenLayoutBinding
-import moe.fuqiuluo.mamu.databinding.FloatingWindowLayoutBinding
-import moe.fuqiuluo.mamu.driver.ProcessDeathMonitor
-import moe.fuqiuluo.mamu.driver.WuwaDriver
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import moe.fuqiuluo.mamu.MainActivity
+import moe.fuqiuluo.mamu.R
 import moe.fuqiuluo.mamu.data.settings.filterLinuxProcess
 import moe.fuqiuluo.mamu.data.settings.filterSystemProcess
+import moe.fuqiuluo.mamu.data.settings.selectedMemoryRanges
+import moe.fuqiuluo.mamu.data.settings.tabSwitchAnimation
+import moe.fuqiuluo.mamu.data.settings.topMostLayer
+import moe.fuqiuluo.mamu.databinding.FloatingFullscreenLayoutBinding
+import moe.fuqiuluo.mamu.databinding.FloatingWindowLayoutBinding
+import moe.fuqiuluo.mamu.driver.ProcessDeathMonitor
+import moe.fuqiuluo.mamu.driver.WuwaDriver
+import moe.fuqiuluo.mamu.floating.FloatingWindowStateManager
 import moe.fuqiuluo.mamu.floating.adapter.ProcessListAdapter
+import moe.fuqiuluo.mamu.floating.controller.*
+import moe.fuqiuluo.mamu.floating.data.model.DisplayProcessInfo
+import moe.fuqiuluo.mamu.floating.data.model.MemoryRange
 import moe.fuqiuluo.mamu.floating.dialog.MemoryRangeDialog
 import moe.fuqiuluo.mamu.floating.dialog.customDialog
+import moe.fuqiuluo.mamu.floating.event.FloatingEventBus
+import moe.fuqiuluo.mamu.floating.event.ProcessStateEvent
+import moe.fuqiuluo.mamu.floating.event.UIActionEvent
+import moe.fuqiuluo.mamu.floating.ext.applyOpacity
+import moe.fuqiuluo.mamu.floating.ext.divideToSimpleMemoryRange
+import moe.fuqiuluo.mamu.floating.listener.DraggableFloatingIconTouchListener
 import moe.fuqiuluo.mamu.utils.ApplicationUtils
 import moe.fuqiuluo.mamu.utils.RootConfigManager
 import moe.fuqiuluo.mamu.utils.RootShellExecutor
 import moe.fuqiuluo.mamu.utils.onError
 import moe.fuqiuluo.mamu.utils.onSuccess
-import moe.fuqiuluo.mamu.floating.FloatingWindowStateManager
-import moe.fuqiuluo.mamu.floating.event.FloatingEventBus
-import moe.fuqiuluo.mamu.floating.event.ProcessStateEvent
-import moe.fuqiuluo.mamu.floating.event.UIActionEvent
-import moe.fuqiuluo.mamu.data.settings.selectedMemoryRanges
-import moe.fuqiuluo.mamu.data.settings.tabSwitchAnimation
-import moe.fuqiuluo.mamu.data.settings.topMostLayer
-import moe.fuqiuluo.mamu.floating.controller.*
-import moe.fuqiuluo.mamu.floating.data.model.MemoryRange
-import moe.fuqiuluo.mamu.floating.ext.applyOpacity
-import moe.fuqiuluo.mamu.floating.ext.divideToSimpleMemoryRange
-import moe.fuqiuluo.mamu.floating.listener.DraggableFloatingIconTouchListener
-import moe.fuqiuluo.mamu.floating.data.model.DisplayProcessInfo
 import moe.fuqiuluo.mamu.widget.*
 
 private const val TAG = "FloatingWindowService"
@@ -96,37 +96,17 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
     // 缓存屏幕方向，避免重复调整布局
     private var currentOrientation = Configuration.ORIENTATION_UNDEFINED
 
-    // 预创建动画对象，避免在动画期间频繁分配内存
-    // Android 官方文档: "请在初始化期间或动画之间分配对象。切勿在动画运行期间进行分配。"
-    private val sharedInterpolator = AccelerateDecelerateInterpolator()
-
-    // Tab 指示器动画 (100ms)
-    private val indicatorFadeIn by lazy {
-        AlphaAnimation(0f, 1f).apply {
-            duration = 100
-            interpolator = sharedInterpolator
-        }
-    }
-    private val indicatorFadeOut by lazy {
-        AlphaAnimation(1f, 0f).apply {
-            duration = 100
-            interpolator = sharedInterpolator
-        }
+    // Tab 索引常量
+    private companion object TabIndices {
+        const val TAB_SETTINGS = 0
+        const val TAB_SEARCH = 1
+        const val TAB_SAVED_ADDRESSES = 2
+        const val TAB_MEMORY_PREVIEW = 3
+        const val TAB_BREAKPOINTS = 4
     }
 
-    // 内容切换动画 (80ms)
-    private val contentFadeIn by lazy {
-        AlphaAnimation(0f, 1f).apply {
-            duration = 80
-            interpolator = sharedInterpolator
-        }
-    }
-    private val contentFadeOut by lazy {
-        AlphaAnimation(1f, 0f).apply {
-            duration = 80
-            interpolator = sharedInterpolator
-        }
-    }
+    // 标记是否正在程序化切换tab（避免递归回调）
+    private var isProgrammaticTabSwitch = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -180,38 +160,74 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
                     is UIActionEvent.ShowProcessSelectionDialog -> {
                         showProcessSelectionDialog()
                     }
+
                     is UIActionEvent.BindProcessRequest -> {
                         handleBindProcess(event.process)
                     }
+
                     is UIActionEvent.UnbindProcessRequest -> {
                         handleUnbindProcess(isUserInitiated = true)
                     }
+
                     is UIActionEvent.ExitOverlayRequest -> {
                         stopSelf()
                     }
+
                     is UIActionEvent.ShowMemoryRangeDialog -> {
                         showMemoryRangeDialog()
                     }
+
                     is UIActionEvent.ApplyOpacityRequest -> {
                         fullscreenBinding.applyOpacity()
                     }
+
                     is UIActionEvent.HideFloatingWindow -> {
                         hideFullscreen()
                     }
+
                     is UIActionEvent.SwitchToSettingsTab -> {
-                        changeCurrentContent(R.id.content_settings, R.id.indicator_settings)
+                        isProgrammaticTabSwitch = true
+                        fullscreenBinding.tabLayout.selectTab(fullscreenBinding.tabLayout.getTabAt(TAB_SETTINGS))
+                        fullscreenBinding.sidebarNavigationRail.selectedItemId = R.id.navigation_settings
+                        updateNavigationRailIndicator(fullscreenBinding.sidebarNavigationRail, R.id.navigation_settings)
+                        isProgrammaticTabSwitch = false
+                        switchToTab(TAB_SETTINGS)
                     }
+
                     is UIActionEvent.SwitchToSearchTab -> {
-                        changeCurrentContent(R.id.content_search, R.id.indicator_search)
+                        isProgrammaticTabSwitch = true
+                        fullscreenBinding.tabLayout.selectTab(fullscreenBinding.tabLayout.getTabAt(TAB_SEARCH))
+                        fullscreenBinding.sidebarNavigationRail.selectedItemId = R.id.navigation_search
+                        updateNavigationRailIndicator(fullscreenBinding.sidebarNavigationRail, R.id.navigation_search)
+                        isProgrammaticTabSwitch = false
+                        switchToTab(TAB_SEARCH)
                     }
+
                     is UIActionEvent.SwitchToSavedAddressesTab -> {
-                        changeCurrentContent(R.id.content_saved_addresses, R.id.indicator_saved_addresses)
+                        isProgrammaticTabSwitch = true
+                        fullscreenBinding.tabLayout.selectTab(fullscreenBinding.tabLayout.getTabAt(TAB_SAVED_ADDRESSES))
+                        fullscreenBinding.sidebarNavigationRail.selectedItemId = R.id.navigation_saved_addresses
+                        updateNavigationRailIndicator(fullscreenBinding.sidebarNavigationRail, R.id.navigation_saved_addresses)
+                        isProgrammaticTabSwitch = false
+                        switchToTab(TAB_SAVED_ADDRESSES)
                     }
+
                     is UIActionEvent.SwitchToMemoryPreviewTab -> {
-                        changeCurrentContent(R.id.content_memory_preview, R.id.indicator_memory_preview)
+                        isProgrammaticTabSwitch = true
+                        fullscreenBinding.tabLayout.selectTab(fullscreenBinding.tabLayout.getTabAt(TAB_MEMORY_PREVIEW))
+                        fullscreenBinding.sidebarNavigationRail.selectedItemId = R.id.navigation_memory_preview
+                        updateNavigationRailIndicator(fullscreenBinding.sidebarNavigationRail, R.id.navigation_memory_preview)
+                        isProgrammaticTabSwitch = false
+                        switchToTab(TAB_MEMORY_PREVIEW)
                     }
+
                     is UIActionEvent.SwitchToBreakpointsTab -> {
-                        changeCurrentContent(R.id.content_breakpoints, R.id.indicator_breakpoints)
+                        isProgrammaticTabSwitch = true
+                        fullscreenBinding.tabLayout.selectTab(fullscreenBinding.tabLayout.getTabAt(TAB_BREAKPOINTS))
+                        fullscreenBinding.sidebarNavigationRail.selectedItemId = R.id.navigation_breakpoints
+                        updateNavigationRailIndicator(fullscreenBinding.sidebarNavigationRail, R.id.navigation_breakpoints)
+                        isProgrammaticTabSwitch = false
+                        switchToTab(TAB_BREAKPOINTS)
                     }
                 }
             }
@@ -239,8 +255,8 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
                     ProcessStateEvent.Type.BOUND -> {
                         updateTopIcon(event.process)
                     }
-                    ProcessStateEvent.Type.UNBOUND,
-                    ProcessStateEvent.Type.DIED -> {
+
+                    ProcessStateEvent.Type.UNBOUND, ProcessStateEvent.Type.DIED -> {
                         updateTopIcon(null)
                     }
                 }
@@ -252,6 +268,11 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
      * 处理进程绑定请求
      */
     private fun handleBindProcess(process: DisplayProcessInfo) {
+        if (!WuwaDriver.isAllowedBindProc(process.packageName ?: process.cmdline)) {
+            notification.showError("该进程禁止绑定!")
+            return
+        }
+
         // 如果当前有绑定的进程，先解绑
         if (WuwaDriver.isProcessBound) {
             WuwaDriver.unbindProcess()
@@ -301,9 +322,7 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
         if (isUserInitiated) {
             // 用户主动终止进程
             RootShellExecutor.exec(
-                suCmd = RootConfigManager.getCustomRootCommand(),
-                "kill -9 $pid",
-                1000
+                suCmd = RootConfigManager.getCustomRootCommand(), "kill -9 $pid", 1000
             ).onSuccess {
                 notification.showSuccess(getString(R.string.success_process_terminated))
             }.onError {
@@ -353,75 +372,62 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
                 val filterLinux = mmkv.filterLinuxProcess
 
                 val processList = withContext(Dispatchers.IO) {
-                    WuwaDriver.listProcessesWithInfo()
-                        .filter { process ->
-                            when {
-                                filterSystem && ApplicationUtils.isSystemApp(
-                                    this@FloatingWindowService,
-                                    process.uid
-                                ) -> false
+                    WuwaDriver.listProcessesWithInfo().filter { process ->
+                        when {
+                            filterSystem && ApplicationUtils.isSystemApp(
+                                this@FloatingWindowService, process.uid
+                            ) -> false
 
-                                filterLinux && process.uid < 1000 -> false
-                                else -> true
+                            filterLinux && process.uid < 1000 -> false
+                            else -> true
+                        }
+                    }.map { process ->
+                        when {
+                            process.name.isEmpty() || ApplicationUtils.isSystemApp(
+                                this@FloatingWindowService, process.uid
+                            ) -> {
+                                DisplayProcessInfo(
+                                    icon = ApplicationUtils.getAndroidIcon(this@FloatingWindowService),
+                                    name = process.name,
+                                    packageName = null,
+                                    pid = process.pid,
+                                    uid = process.uid,
+                                    prio = 1,
+                                    rss = process.rss,
+                                    cmdline = process.name
+                                )
+                            }
+
+                            else -> {
+                                val packageName = process.name.split(":").first()
+                                var prio = 3
+
+                                val appIcon = ApplicationUtils.getAppIconByPackageName(
+                                    this@FloatingWindowService, packageName
+                                ) ?: ApplicationUtils.getAppIconByUid(
+                                    this@FloatingWindowService, process.uid
+                                ) ?: ApplicationUtils.getAndroidIcon(this@FloatingWindowService)
+                                    .also { prio-- }
+
+                                val appName = ApplicationUtils.getAppNameByPackageName(
+                                    this@FloatingWindowService, packageName
+                                ) ?: ApplicationUtils.getAppNameByUid(
+                                    this@FloatingWindowService, process.uid
+                                ) ?: process.name.also { prio-- }
+
+                                DisplayProcessInfo(
+                                    icon = appIcon,
+                                    name = appName,
+                                    packageName = packageName,
+                                    pid = process.pid,
+                                    uid = process.uid,
+                                    prio = prio,
+                                    rss = process.rss,
+                                    cmdline = process.name
+                                )
                             }
                         }
-                        .map { process ->
-                            when {
-                                process.name.isEmpty() || ApplicationUtils.isSystemApp(
-                                    this@FloatingWindowService,
-                                    process.uid
-                                ) -> {
-                                    DisplayProcessInfo(
-                                        icon = ApplicationUtils.getAndroidIcon(this@FloatingWindowService),
-                                        name = process.name,
-                                        packageName = null,
-                                        pid = process.pid,
-                                        uid = process.uid,
-                                        prio = 1,
-                                        rss = process.rss,
-                                        cmdline = process.name
-                                    )
-                                }
-
-                                else -> {
-                                    val packageName = process.name.split(":").first()
-                                    var prio = 3
-
-                                    val appIcon = ApplicationUtils.getAppIconByPackageName(
-                                        this@FloatingWindowService,
-                                        packageName
-                                    )
-                                        ?: ApplicationUtils.getAppIconByUid(
-                                            this@FloatingWindowService,
-                                            process.uid
-                                        )
-                                        ?: ApplicationUtils.getAndroidIcon(this@FloatingWindowService)
-                                            .also { prio-- }
-
-                                    val appName = ApplicationUtils.getAppNameByPackageName(
-                                        this@FloatingWindowService,
-                                        packageName
-                                    )
-                                        ?: ApplicationUtils.getAppNameByUid(
-                                            this@FloatingWindowService,
-                                            process.uid
-                                        )
-                                        ?: process.name.also { prio-- }
-
-                                    DisplayProcessInfo(
-                                        icon = appIcon,
-                                        name = appName,
-                                        packageName = packageName,
-                                        pid = process.pid,
-                                        uid = process.uid,
-                                        prio = prio,
-                                        rss = process.rss,
-                                        cmdline = process.name
-                                    )
-                                }
-                            }
-                        }
-                        .sortedByDescending { it.prio }
+                    }.sortedByDescending { it.prio }
                 }
 
                 val adapter = ProcessListAdapter(this@FloatingWindowService, processList)
@@ -432,10 +438,13 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
                         val selectedProcess = processList[position]
                         // 发送绑定进程请求事件，由 Service 统一处理绑定逻辑
                         coroutineScope.launch {
-                            FloatingEventBus.emitUIAction(UIActionEvent.BindProcessRequest(selectedProcess))
+                            FloatingEventBus.emitUIAction(
+                                UIActionEvent.BindProcessRequest(
+                                    selectedProcess
+                                )
+                            )
                         }
-                    }
-                )
+                    })
             }.onFailure {
                 Log.e(TAG, it.stackTraceToString())
                 notification.showError("加载进程列表失败: ${it.message}")
@@ -465,8 +474,7 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
         val defaultCheckedItems = allRanges.map { defaultRanges.contains(it) }.toBooleanArray()
 
         val memorySizes = if (WuwaDriver.isProcessBound) runCatching {
-            val regions = WuwaDriver.queryMemRegions()
-                .divideToSimpleMemoryRange()
+            val regions = WuwaDriver.queryMemRegions().divideToSimpleMemoryRange()
             regions.groupBy { it.range }.mapValues { (_, entries) ->
                 entries.sumOf { it.end - it.start }
             }
@@ -501,13 +509,11 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
         val preferTopMost = MMKV.defaultMMKV().topMostLayer
 
         var layoutFlag = if (preferTopMost) {
-            @Suppress("DEPRECATION")
-            WindowManager.LayoutParams.TYPE_SYSTEM_ALERT
+            @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_SYSTEM_ALERT
         } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         } else {
-            @Suppress("DEPRECATION")
-            WindowManager.LayoutParams.TYPE_PHONE
+            @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
         }
 
         val iconSizePx = resources.getDimensionPixelSize(R.dimen.overlay_icon_size)
@@ -516,8 +522,7 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
             iconSizePx,
             layoutFlag,
             // 启用硬件加速以提升渲染性能
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
             PixelFormat.TRANSLUCENT
         )
 
@@ -537,8 +542,7 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
                 layoutFlag = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
                 } else {
-                    @Suppress("DEPRECATION")
-                    WindowManager.LayoutParams.TYPE_PHONE
+                    @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
                 }
                 params.type = layoutFlag
                 windowManager.addView(floatingIconView, params)
@@ -565,13 +569,11 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
         val preferTopMost = MMKV.defaultMMKV().topMostLayer
 
         var layoutFlag = if (preferTopMost) {
-            @Suppress("DEPRECATION")
-            WindowManager.LayoutParams.TYPE_SYSTEM_ALERT
+            @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_SYSTEM_ALERT
         } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         } else {
-            @Suppress("DEPRECATION")
-            WindowManager.LayoutParams.TYPE_PHONE
+            @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
         }
 
         val params = WindowManager.LayoutParams(
@@ -579,8 +581,7 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
             WindowManager.LayoutParams.MATCH_PARENT,
             layoutFlag,
             // 启用硬件加速以提升渲染性能
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
             PixelFormat.TRANSLUCENT
         )
 
@@ -598,8 +599,7 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
                 layoutFlag = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
                 } else {
-                    @Suppress("DEPRECATION")
-                    WindowManager.LayoutParams.TYPE_PHONE
+                    @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
                 }
                 params.type = layoutFlag
                 windowManager.addView(fullscreenView, params)
@@ -614,71 +614,204 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
 
         initializeBottomInfoBar()
 
-        // 默认显示搜索tab
-        changeCurrentContent(R.id.content_search, R.id.indicator_search)
+        // 默认显示搜索tab (使用 TabLayout 和 NavigationRail API)
+        isProgrammaticTabSwitch = true
+        fullscreenBinding.tabLayout.selectTab(fullscreenBinding.tabLayout.getTabAt(TAB_SEARCH))
+        fullscreenBinding.sidebarNavigationRail.selectedItemId = R.id.navigation_search
+        isProgrammaticTabSwitch = false
+        switchToTab(TAB_SEARCH)
+
         // 初始化布局方向（根据当前屏幕方向）
         currentOrientation = resources.configuration.orientation
         adjustLayoutForOrientation(currentOrientation)
     }
 
     private fun setupTopBar() {
-        // 顶部工具栏（竖屏）
+        // 顶部工具栏应用图标
         fullscreenBinding.attachedAppIcon.setOnClickListener {
             showProcessSelectionDialog()
         }
 
+        // 关闭按钮
         fullscreenBinding.btnCloseFullscreen.setOnClickListener {
             hideFullscreen()
         }
 
-        fullscreenBinding.tabSettings.setOnClickListener {
-            changeCurrentContent(R.id.content_settings, R.id.indicator_settings)
-        }
-
-        fullscreenBinding.tabSearch.setOnClickListener {
-            changeCurrentContent(R.id.content_search, R.id.indicator_search)
-        }
-
-        fullscreenBinding.tabSavedAddresses.setOnClickListener {
-            changeCurrentContent(R.id.content_saved_addresses, R.id.indicator_saved_addresses)
-        }
-
-        fullscreenBinding.tabMemoryPreview.setOnClickListener {
-            changeCurrentContent(R.id.content_memory_preview, R.id.indicator_memory_preview)
-        }
-
-        fullscreenBinding.tabBreakpoints.setOnClickListener {
-            changeCurrentContent(R.id.content_breakpoints, R.id.indicator_breakpoints)
-        }
-
-        // 侧边栏（横屏）
+        // 侧边栏应用图标
         fullscreenBinding.sidebarAppIcon.setOnClickListener {
             showProcessSelectionDialog()
         }
 
+        // 侧边栏关闭按钮
         fullscreenBinding.sidebarBtnClose.setOnClickListener {
             hideFullscreen()
         }
 
-        fullscreenBinding.sidebarTabSettings.setOnClickListener {
-            changeCurrentContent(R.id.content_settings, R.id.indicator_settings)
+        // 设置 TabLayout（顶部工具栏）
+        fullscreenBinding.tabLayout.apply {
+            removeAllTabs()
+            addTab(newTab().setIcon(R.drawable.icon_settings_24px).setContentDescription(getString(R.string.tab_settings)))
+            addTab(newTab().setIcon(R.drawable.icon_search_24px).setContentDescription(getString(R.string.tab_search)))
+            addTab(newTab().setIcon(R.drawable.icon_save_24px).setContentDescription(getString(R.string.tab_saved_addresses)))
+            addTab(newTab().setIcon(R.drawable.icon_list_24px).setContentDescription(getString(R.string.tab_memory_preview)))
+            addTab(newTab().setIcon(R.drawable.icon_bug_report_24px).setContentDescription(getString(R.string.tab_breakpoints)))
+
+            addOnTabSelectedListener(object : com.google.android.material.tabs.TabLayout.OnTabSelectedListener {
+                override fun onTabSelected(tab: com.google.android.material.tabs.TabLayout.Tab?) {
+                    if (isProgrammaticTabSwitch) return
+                    tab?.let {
+                        switchToTab(it.position)
+                        // 同步侧边栏 NavigationRail
+                        val itemId = getNavigationItemIdByIndex(it.position)
+                        if (fullscreenBinding.sidebarNavigationRail.selectedItemId != itemId) {
+                            isProgrammaticTabSwitch = true
+                            fullscreenBinding.sidebarNavigationRail.selectedItemId = itemId
+                            isProgrammaticTabSwitch = false
+                        }
+                    }
+                }
+
+                override fun onTabUnselected(tab: com.google.android.material.tabs.TabLayout.Tab?) {}
+                override fun onTabReselected(tab: com.google.android.material.tabs.TabLayout.Tab?) {}
+            })
         }
 
-        fullscreenBinding.sidebarTabSearch.setOnClickListener {
-            changeCurrentContent(R.id.content_search, R.id.indicator_search)
+        // 设置 NavigationRail（侧边栏）
+        fullscreenBinding.sidebarNavigationRail.apply {
+            setOnItemSelectedListener { item ->
+                if (isProgrammaticTabSwitch) return@setOnItemSelectedListener true
+
+                val tabIndex = getTabIndexByNavigationItemId(item.itemId)
+                switchToTab(tabIndex)
+
+                // 更新自定义指示器
+                updateNavigationRailIndicator(this, item.itemId)
+
+                // 同步顶部 TabLayout
+                if (fullscreenBinding.tabLayout.selectedTabPosition != tabIndex) {
+                    isProgrammaticTabSwitch = true
+                    fullscreenBinding.tabLayout.selectTab(fullscreenBinding.tabLayout.getTabAt(tabIndex))
+                    isProgrammaticTabSwitch = false
+                }
+                true
+            }
+
+            // 添加自定义左侧指示器
+            post {
+                addCustomIndicatorToNavigationRail(this)
+            }
+        }
+    }
+
+    /**
+     * 为 NavigationRail 添加自定义左侧指示器
+     */
+    private fun addCustomIndicatorToNavigationRail(navigationRail: com.google.android.material.navigationrail.NavigationRailView) {
+        try {
+            val menuView = navigationRail.getChildAt(0) as? ViewGroup ?: return
+
+            for (i in 0 until menuView.childCount) {
+                val itemView = menuView.getChildAt(i) as? ViewGroup ?: continue
+
+                // 创建左侧指示器
+                val indicator = View(this).apply {
+                    layoutParams = FrameLayout.LayoutParams(
+                        dp(4), // 宽度 4dp
+                        dp(32) // 高度 32dp
+                    ).apply {
+                        gravity = Gravity.START or Gravity.CENTER_VERTICAL
+                    }
+                    setBackgroundColor(resources.getColor(R.color.floating_primary, null))
+                    visibility = View.GONE // 默认隐藏
+                    tag = "custom_indicator"
+                }
+
+                // 添加指示器到 item
+                if (itemView is FrameLayout) {
+                    itemView.addView(indicator, 0) // 添加到最底层
+                }
+            }
+
+            // 更新指示器显示状态
+            updateNavigationRailIndicator(navigationRail, navigationRail.selectedItemId)
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to add custom indicator to NavigationRail", e)
+        }
+    }
+
+    /**
+     * 更新 NavigationRail 指示器显示
+     */
+    private fun updateNavigationRailIndicator(
+        navigationRail: com.google.android.material.navigationrail.NavigationRailView,
+        selectedItemId: Int
+    ) {
+        try {
+            val menuView = navigationRail.getChildAt(0) as? ViewGroup ?: return
+
+            for (i in 0 until menuView.childCount) {
+                val itemView = menuView.getChildAt(i) as? ViewGroup ?: continue
+                val indicator = itemView.findViewWithTag<View>("custom_indicator") ?: continue
+
+                val menuItem = navigationRail.menu.getItem(i)
+                indicator.visibility = if (menuItem.itemId == selectedItemId) View.VISIBLE else View.GONE
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to update NavigationRail indicator", e)
+        }
+    }
+
+    /**
+     * 根据 tab 索引获取 NavigationRail 的 item ID
+     */
+    private fun getNavigationItemIdByIndex(index: Int): Int {
+        return when (index) {
+            TAB_SETTINGS -> R.id.navigation_settings
+            TAB_SEARCH -> R.id.navigation_search
+            TAB_SAVED_ADDRESSES -> R.id.navigation_saved_addresses
+            TAB_MEMORY_PREVIEW -> R.id.navigation_memory_preview
+            TAB_BREAKPOINTS -> R.id.navigation_breakpoints
+            else -> R.id.navigation_search
+        }
+    }
+
+    /**
+     * 根据 NavigationRail 的 item ID 获取 tab 索引
+     */
+    private fun getTabIndexByNavigationItemId(itemId: Int): Int {
+        return when (itemId) {
+            R.id.navigation_settings -> TAB_SETTINGS
+            R.id.navigation_search -> TAB_SEARCH
+            R.id.navigation_saved_addresses -> TAB_SAVED_ADDRESSES
+            R.id.navigation_memory_preview -> TAB_MEMORY_PREVIEW
+            R.id.navigation_breakpoints -> TAB_BREAKPOINTS
+            else -> TAB_SEARCH
+        }
+    }
+
+    /**
+     * 根据 tab 索引切换内容视图
+     */
+    private fun switchToTab(tabIndex: Int) {
+        val contentId = when (tabIndex) {
+            TAB_SETTINGS -> R.id.content_settings
+            TAB_SEARCH -> R.id.content_search
+            TAB_SAVED_ADDRESSES -> R.id.content_saved_addresses
+            TAB_MEMORY_PREVIEW -> R.id.content_memory_preview
+            TAB_BREAKPOINTS -> R.id.content_breakpoints
+            else -> R.id.content_search
         }
 
-        fullscreenBinding.sidebarTabSavedAddresses.setOnClickListener {
-            changeCurrentContent(R.id.content_saved_addresses, R.id.indicator_saved_addresses)
+        val contentContainer = fullscreenBinding.contentContainer
+
+        // 隐藏所有内容视图
+        for (i in 0 until contentContainer.childCount) {
+            contentContainer.getChildAt(i).visibility = View.GONE
         }
 
-        fullscreenBinding.sidebarTabMemoryPreview.setOnClickListener {
-            changeCurrentContent(R.id.content_memory_preview, R.id.indicator_memory_preview)
-        }
-
-        fullscreenBinding.sidebarTabBreakpoints.setOnClickListener {
-            changeCurrentContent(R.id.content_breakpoints, R.id.indicator_breakpoints)
-        }
+        // 显示选中的内容视图
+        contentContainer.findViewById<View>(contentId)?.visibility = View.VISIBLE
     }
 
     private fun initializeControllers() {
@@ -689,11 +822,11 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
             notification = notification
         )
 
+        // TODO: 重新添加 badge views 到新的 TabLayout
         // 设置 badge views (顶部工具栏和侧边栏)
-        savedAddressController.setAddressCountBadgeView(
-            fullscreenBinding.badgeSavedAddresses,
-            fullscreenBinding.sidebarBadgeSavedAddresses
-        )
+        // savedAddressController.setAddressCountBadgeView(
+        //     fullscreenBinding.badgeSavedAddresses, fullscreenBinding.sidebarBadgeSavedAddresses
+        // )
 
         searchController = SearchController(
             context = this,
@@ -703,9 +836,7 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
         )
 
         settingsController = SettingsController(
-            context = this,
-            binding = fullscreenBinding.contentSettings,
-            notification = notification
+            context = this, binding = fullscreenBinding.contentSettings, notification = notification
         )
 
         memoryPreviewController = MemoryPreviewController(
@@ -816,34 +947,10 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
 
         bottomInfoBar.layoutParams = bottomLayoutParams
 
-        // 同步侧边栏的 indicator 状态
-        syncIndicatorState()
+        // TabLayout 自动管理指示器状态，不需要手动同步
 
         if (::searchController.isInitialized) {
             searchController.adjustLayoutForOrientation(orientation)
-        }
-    }
-
-    private fun syncIndicatorState() {
-        // 同步顶部工具栏和侧边栏的 indicator 状态
-        val toolbarIndicators = listOf(
-            fullscreenBinding.indicatorSettings,
-            fullscreenBinding.indicatorSearch,
-            fullscreenBinding.indicatorSavedAddresses,
-            fullscreenBinding.indicatorMemoryPreview,
-            fullscreenBinding.indicatorBreakpoints
-        )
-
-        val sidebarIndicators = listOf(
-            fullscreenBinding.sidebarIndicatorSettings,
-            fullscreenBinding.sidebarIndicatorSearch,
-            fullscreenBinding.sidebarIndicatorSavedAddresses,
-            fullscreenBinding.sidebarIndicatorMemoryPreview,
-            fullscreenBinding.sidebarIndicatorBreakpoints
-        )
-
-        toolbarIndicators.forEachIndexed { index, toolbarIndicator ->
-            sidebarIndicators[index].visibility = toolbarIndicator.visibility
         }
     }
 
@@ -870,21 +977,15 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
         val pendingIntent = PendingIntent.getActivity(
-            this,
-            0,
-            intent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            this, 0, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.notification_title))
             .setContentText(getString(R.string.notification_text))
-            .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentIntent(pendingIntent)
-            .setOngoing(true)
+            .setSmallIcon(R.mipmap.ic_launcher).setContentIntent(pendingIntent).setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .build()
+            .setCategory(NotificationCompat.CATEGORY_SERVICE).build()
     }
 
     override fun onDestroy() {
@@ -911,119 +1012,6 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
 
         // 通知悬浮窗已关闭
         FloatingWindowStateManager.setActive(false)
-    }
-
-    private fun changeCurrentContent(contentId: Int, indicatorId: Int) {
-        val mmkv = MMKV.defaultMMKV()
-        val enableAnimation = mmkv.tabSwitchAnimation
-
-        fun updateTabIndicator(activeIndicatorId: Int) {
-            // 顶部工具栏 indicators
-            val toolbarIndicators = mapOf(
-                R.id.indicator_settings to fullscreenBinding.indicatorSettings,
-                R.id.indicator_search to fullscreenBinding.indicatorSearch,
-                R.id.indicator_saved_addresses to fullscreenBinding.indicatorSavedAddresses,
-                R.id.indicator_memory_preview to fullscreenBinding.indicatorMemoryPreview,
-                R.id.indicator_breakpoints to fullscreenBinding.indicatorBreakpoints
-            )
-
-            // 侧边栏 indicators (映射到相同的 activeIndicatorId)
-            val sidebarIndicators = mapOf(
-                R.id.indicator_settings to fullscreenBinding.sidebarIndicatorSettings,
-                R.id.indicator_search to fullscreenBinding.sidebarIndicatorSearch,
-                R.id.indicator_saved_addresses to fullscreenBinding.sidebarIndicatorSavedAddresses,
-                R.id.indicator_memory_preview to fullscreenBinding.sidebarIndicatorMemoryPreview,
-                R.id.indicator_breakpoints to fullscreenBinding.sidebarIndicatorBreakpoints
-            )
-
-            // 合并所有 indicators
-            val allIndicators = toolbarIndicators + sidebarIndicators
-
-            if (enableAnimation) {
-                allIndicators.forEach { (indicatorId, indicator) ->
-                    if (indicatorId == activeIndicatorId) {
-                        if (indicator.visibility != View.VISIBLE) {
-                            // 复用预创建的动画对象
-                            indicatorFadeIn.reset()
-                            indicator.visibility = View.VISIBLE
-                            indicator.startAnimation(indicatorFadeIn)
-                        }
-                    } else {
-                        if (indicator.isVisible) {
-                            // 使用 animate() API 代替 Animation，更高效且自动管理生命周期
-                            indicator.animate()
-                                .alpha(0f)
-                                .setDuration(100)
-                                .setInterpolator(sharedInterpolator)
-                                .withEndAction {
-                                    indicator.visibility = View.GONE
-                                    indicator.alpha = 1f  // 重置 alpha 供下次使用
-                                }
-                                .start()
-                        }
-                    }
-                }
-            } else {
-                allIndicators.forEach { (indicatorId, indicator) ->
-                    indicator.visibility =
-                        if (indicatorId == activeIndicatorId) View.VISIBLE else View.GONE
-                }
-            }
-        }
-
-        val contentContainer = fullscreenBinding.contentContainer
-
-        var currentVisibleView: View? = null
-        for (i in 0 until contentContainer.childCount) {
-            val child = contentContainer.getChildAt(i)
-            if (child.isVisible) {
-                currentVisibleView = child
-                break
-            }
-        }
-
-        val targetView = contentContainer.findViewById<View>(contentId) ?: return
-
-        if (currentVisibleView == targetView) {
-            updateTabIndicator(indicatorId)
-            return
-        }
-
-        if (enableAnimation) {
-            currentVisibleView?.let { current ->
-                // 使用 View.animate() API，更高效且无需频繁创建对象
-                current.animate()
-                    .alpha(0f)
-                    .setDuration(80)
-                    .setInterpolator(sharedInterpolator)
-                    .withEndAction {
-                        current.visibility = View.GONE
-                        current.alpha = 1f  // 重置 alpha
-
-                        targetView.alpha = 0f
-                        targetView.visibility = View.VISIBLE
-                        targetView.animate()
-                            .alpha(1f)
-                            .setDuration(80)
-                            .setInterpolator(sharedInterpolator)
-                            .start()
-                    }
-                    .start()
-            } ?: run {
-                targetView.alpha = 0f
-                targetView.visibility = View.VISIBLE
-                targetView.animate()
-                    .alpha(1f)
-                    .setDuration(80)
-                    .setInterpolator(sharedInterpolator)
-                    .start()
-            }
-        } else {
-            currentVisibleView?.visibility = View.GONE
-            targetView.visibility = View.VISIBLE
-        }
-
-        updateTabIndicator(indicatorId)
     }
 
     private fun updateTopIcon(process: DisplayProcessInfo?) {
@@ -1076,10 +1064,7 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
         sortedRanges.forEach { range ->
             val end = start + range.code.length
             spannable.setSpan(
-                ForegroundColorSpan(range.color),
-                start,
-                end,
-                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                ForegroundColorSpan(range.color), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
             )
             start = end + 1
         }
@@ -1091,6 +1076,5 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
         handleProcessDied(pid)
     }
 
-    private fun dp(value: Int): Int =
-        (value * resources.displayMetrics.density).toInt()
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 }
