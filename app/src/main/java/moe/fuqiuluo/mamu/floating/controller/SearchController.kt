@@ -458,6 +458,9 @@ class SearchController(
         }
 
         // 单例模式：复用 FuzzySearchDialog 实例
+        if (!SearchEngine.isSearching() && SearchEngine.getTotalResultCount() <= 0) {
+            fuzzySearchDialog = null
+        }
         if (fuzzySearchDialog == null) {
             fuzzySearchDialog = FuzzySearchDialog(
                 context = context,
@@ -491,6 +494,14 @@ class SearchController(
     fun showSearchProgressIfNeeded() {
         searchDialog?.showProgressDialogIfSearching()
         fuzzySearchDialog?.showProgressDialogIfSearching()
+    }
+
+    /**
+     * 如果模糊搜索已完成且有结果，重新显示模糊搜索对话框
+     * 用于重新进入全屏时恢复对话框，让用户继续细化
+     */
+    fun showFuzzySearchDialogIfCompleted() {
+        fuzzySearchDialog?.showDialogIfSearchCompleted()
     }
 
     private fun onRefineCompleted(totalFound: Long) {

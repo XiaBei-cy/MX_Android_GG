@@ -1001,6 +1001,8 @@ class FloatingWindowService : Service(), ProcessDeathMonitor.Callback {
 
         // 重新显示搜索进度对话框（如果正在搜索）
         searchController.showSearchProgressIfNeeded()
+        // 重新显示模糊搜索对话框（如果搜索已完成且有结果）
+        searchController.showFuzzySearchDialogIfCompleted()
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {

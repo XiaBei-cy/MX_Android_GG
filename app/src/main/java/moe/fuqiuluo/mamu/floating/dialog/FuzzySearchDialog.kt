@@ -3,6 +3,7 @@ package moe.fuqiuluo.mamu.floating.dialog
 import android.annotation.SuppressLint
 import android.content.Context
 import android.text.InputType
+import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.animation.Animation
@@ -12,10 +13,16 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import androidx.appcompat.app.AlertDialog
 import com.google.android.material.button.MaterialButton
-import com.google.android.material.divider.MaterialDivider
 import com.google.android.material.textview.MaterialTextView
 import com.tencent.mmkv.MMKV
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import moe.fuqiuluo.mamu.R
 import moe.fuqiuluo.mamu.data.settings.getDialogOpacity
 import moe.fuqiuluo.mamu.data.settings.selectedMemoryRanges
@@ -25,6 +32,8 @@ import moe.fuqiuluo.mamu.driver.SearchMode
 import moe.fuqiuluo.mamu.driver.WuwaDriver
 import moe.fuqiuluo.mamu.floating.data.model.DisplayMemRegionEntry
 import moe.fuqiuluo.mamu.floating.data.model.DisplayValueType
+import moe.fuqiuluo.mamu.floating.event.FloatingEventBus
+import moe.fuqiuluo.mamu.floating.event.UIActionEvent
 import moe.fuqiuluo.mamu.floating.ext.divideToSimpleMemoryRange
 import moe.fuqiuluo.mamu.floating.ext.formatElapsedTime
 import moe.fuqiuluo.mamu.widget.FixedLinearLayout
@@ -65,6 +74,9 @@ class FuzzySearchDialog(
     private var progressDialog: SearchProgressDialog? = null
     var isSearching = false
     private var searchStartTime = 0L
+
+    // 标记搜索完成且有结果，等待恢复显示
+    private var shouldShowAfterFullscreen = false
 
     @SuppressLint("SetTextI18n")
     override fun setupDialog() {
@@ -181,10 +193,14 @@ class FuzzySearchDialog(
      */
     private fun setupRefineButtons() {
         // 基础条件
-        contentView.findViewById<MaterialButton>(R.id.btn_unchanged)?.setOnClickListener { startRefineSearch(FuzzyCondition.UNCHANGED) }
-        contentView.findViewById<MaterialButton>(R.id.btn_changed)?.setOnClickListener { startRefineSearch(FuzzyCondition.CHANGED) }
-        contentView.findViewById<MaterialButton>(R.id.btn_increased)?.setOnClickListener { startRefineSearch(FuzzyCondition.INCREASED) }
-        contentView.findViewById<MaterialButton>(R.id.btn_decreased)?.setOnClickListener { startRefineSearch(FuzzyCondition.DECREASED) }
+        contentView.findViewById<MaterialButton>(R.id.btn_unchanged)
+            ?.setOnClickListener { startRefineSearch(FuzzyCondition.UNCHANGED) }
+        contentView.findViewById<MaterialButton>(R.id.btn_changed)
+            ?.setOnClickListener { startRefineSearch(FuzzyCondition.CHANGED) }
+        contentView.findViewById<MaterialButton>(R.id.btn_increased)
+            ?.setOnClickListener { startRefineSearch(FuzzyCondition.INCREASED) }
+        contentView.findViewById<MaterialButton>(R.id.btn_decreased)
+            ?.setOnClickListener { startRefineSearch(FuzzyCondition.DECREASED) }
 
         // 增加指定值
         contentView.findViewById<MaterialButton>(R.id.btn_increased_by_1)?.setOnClickListener {
@@ -215,39 +231,48 @@ class FuzzySearchDialog(
         }
 
         // 增加百分比
-        contentView.findViewById<MaterialButton>(R.id.btn_increased_by_10_percent)?.setOnClickListener {
-            startRefineSearch(FuzzyCondition.INCREASED_BY_PERCENT, 10)
-        }
-        contentView.findViewById<MaterialButton>(R.id.btn_increased_by_50_percent)?.setOnClickListener {
-            startRefineSearch(FuzzyCondition.INCREASED_BY_PERCENT, 50)
-        }
-        contentView.findViewById<MaterialButton>(R.id.btn_increased_by_100_percent)?.setOnClickListener {
-            startRefineSearch(FuzzyCondition.INCREASED_BY_PERCENT, 100)
-        }
-        contentView.findViewById<MaterialButton>(R.id.btn_increased_by_percent_custom)?.setOnClickListener {
-            showCustomPercentDialog(FuzzyCondition.INCREASED_BY_PERCENT)
-        }
+        contentView.findViewById<MaterialButton>(R.id.btn_increased_by_10_percent)
+            ?.setOnClickListener {
+                startRefineSearch(FuzzyCondition.INCREASED_BY_PERCENT, 10)
+            }
+        contentView.findViewById<MaterialButton>(R.id.btn_increased_by_50_percent)
+            ?.setOnClickListener {
+                startRefineSearch(FuzzyCondition.INCREASED_BY_PERCENT, 50)
+            }
+        contentView.findViewById<MaterialButton>(R.id.btn_increased_by_100_percent)
+            ?.setOnClickListener {
+                startRefineSearch(FuzzyCondition.INCREASED_BY_PERCENT, 100)
+            }
+        contentView.findViewById<MaterialButton>(R.id.btn_increased_by_percent_custom)
+            ?.setOnClickListener {
+                showCustomPercentDialog(FuzzyCondition.INCREASED_BY_PERCENT)
+            }
 
         // 减少百分比
-        contentView.findViewById<MaterialButton>(R.id.btn_decreased_by_10_percent)?.setOnClickListener {
-            startRefineSearch(FuzzyCondition.DECREASED_BY_PERCENT, 10)
-        }
-        contentView.findViewById<MaterialButton>(R.id.btn_decreased_by_50_percent)?.setOnClickListener {
-            startRefineSearch(FuzzyCondition.DECREASED_BY_PERCENT, 50)
-        }
-        contentView.findViewById<MaterialButton>(R.id.btn_decreased_by_100_percent)?.setOnClickListener {
-            startRefineSearch(FuzzyCondition.DECREASED_BY_PERCENT, 100)
-        }
-        contentView.findViewById<MaterialButton>(R.id.btn_decreased_by_percent_custom)?.setOnClickListener {
-            showCustomPercentDialog(FuzzyCondition.DECREASED_BY_PERCENT)
-        }
+        contentView.findViewById<MaterialButton>(R.id.btn_decreased_by_10_percent)
+            ?.setOnClickListener {
+                startRefineSearch(FuzzyCondition.DECREASED_BY_PERCENT, 10)
+            }
+        contentView.findViewById<MaterialButton>(R.id.btn_decreased_by_50_percent)
+            ?.setOnClickListener {
+                startRefineSearch(FuzzyCondition.DECREASED_BY_PERCENT, 50)
+            }
+        contentView.findViewById<MaterialButton>(R.id.btn_decreased_by_100_percent)
+            ?.setOnClickListener {
+                startRefineSearch(FuzzyCondition.DECREASED_BY_PERCENT, 100)
+            }
+        contentView.findViewById<MaterialButton>(R.id.btn_decreased_by_percent_custom)
+            ?.setOnClickListener {
+                showCustomPercentDialog(FuzzyCondition.DECREASED_BY_PERCENT)
+            }
     }
 
     /**
      * 切换高级选项显示/隐藏
      */
     private fun toggleAdvancedOptions() {
-        val layoutAdvancedOptions = contentView.findViewById<LinearLayout>(R.id.layout_advanced_options) ?: return
+        val layoutAdvancedOptions =
+            contentView.findViewById<LinearLayout>(R.id.layout_advanced_options) ?: return
         val ivExpandIcon = contentView.findViewById<ImageView>(R.id.iv_expand_icon) ?: return
 
         val isExpanded = layoutAdvancedOptions.visibility == View.VISIBLE
@@ -298,7 +323,8 @@ class FuzzySearchDialog(
             showRadioButton = false,
             onSingleChoice = { which ->
                 currentValueType = allValueTypes[which]
-                contentView.findViewById<MaterialTextView>(R.id.btn_select_type)?.text = currentValueType.displayName
+                contentView.findViewById<MaterialTextView>(R.id.btn_select_type)?.text =
+                    currentValueType.displayName
             }
         )
     }
@@ -308,7 +334,8 @@ class FuzzySearchDialog(
      */
     private fun showCustomValueDialog(condition: FuzzyCondition) {
         val input = EditText(context).apply {
-            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            inputType =
+                InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED or InputType.TYPE_NUMBER_FLAG_DECIMAL
             hint = "输入数值"
         }
 
@@ -414,6 +441,7 @@ class FuzzySearchDialog(
 
             withContext(Dispatchers.Main) {
                 if (success) {
+                    super.dismiss()  // 关闭主对话框，只保留进度对话框
                     isSearching = true
                     searchStartTime = System.currentTimeMillis()
                     showProgressDialog(false)
@@ -449,6 +477,7 @@ class FuzzySearchDialog(
 
             withContext(Dispatchers.Main) {
                 if (success) {
+                    super.dismiss()  // 关闭主对话框，只保留进度对话框
                     isSearching = true
                     searchStartTime = System.currentTimeMillis()
                     showProgressDialog(true)
@@ -497,8 +526,10 @@ class FuzzySearchDialog(
                 cancelSearch()
             },
             onHideClick = {
-                // 隐藏对话框但保持搜索继续
-                dismiss()
+                // 发送隐藏悬浮窗事件
+                searchScope.launch {
+                    FloatingEventBus.emitUIAction(UIActionEvent.HideFloatingWindow)
+                }
             }
         ).apply {
             show()
@@ -571,6 +602,12 @@ class FuzzySearchDialog(
         }
         updateCurrentResults()
 
+        // 如果有结果，标记为等待恢复显示
+        if (totalFound > 0) {
+            Log.d(TAG, "再次恢复全屏将自动显示模糊搜索dialog")
+            shouldShowAfterFullscreen = true
+        }
+
         // 回调
         if (isRefineSearch) {
             onRefineCompleted?.invoke(totalFound)
@@ -617,6 +654,7 @@ class FuzzySearchDialog(
      */
     fun hideProgressDialog() {
         progressDialog?.dismiss()
+        progressDialog = null
     }
 
     /**
@@ -629,6 +667,17 @@ class FuzzySearchDialog(
         }
     }
 
+    /**
+     * 如果搜索已完成且有结果，重新显示主对话框
+     * 用于重新进入全屏时恢复对话框，让用户继续细化
+     */
+    fun showDialogIfSearchCompleted() {
+        if (shouldShowAfterFullscreen) {
+            shouldShowAfterFullscreen = false
+            show()
+        }
+    }
+
     fun release() {
         progressDialog?.dismiss()
         progressDialog = null
@@ -636,6 +685,10 @@ class FuzzySearchDialog(
     }
 
     override fun dismiss() {
+        // 清除恢复显示标志
+        shouldShowAfterFullscreen = false
+        Log.d(TAG, "这里销毁dialog，不会再次显示了! $this")
+
         if (!isSearching) {
             release()
         }
