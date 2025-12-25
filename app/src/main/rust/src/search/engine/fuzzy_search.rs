@@ -3,12 +3,53 @@ use super::super::types::{FuzzyCondition, ValueType};
 use super::manager::{BPLUS_TREE_ORDER, PAGE_SIZE};
 use crate::core::DRIVER_MANAGER;
 use crate::wuwa::PageStatusBitmap;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use bplustree::BPlusTreeSet;
-use log::{Level, debug, log_enabled, warn};
+use log::{debug, log_enabled, warn, Level};
 use rayon::prelude::*;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+
+/// 批量读取：最大合并间隙（4KB，即1页大小）
+/// 当两个地址之间的间隙小于此值时，合并为同一批次
+const BATCH_MAX_GAP: u64 = 4096;
+
+/// 批量读取：单批次大小上限（64KB）
+const BATCH_MAX_SIZE: usize = 64 * 1024;
+
+/// 进度更新：每处理多少批次更新一次进度
+const PROGRESS_UPDATE_BATCH_SIZE: usize = 1;
+
+/// 地址批次 - 表示一段连续或接近连续的内存区域
+#[derive(Debug)]
+struct AddressBatch {
+    start_addr: u64,          // 批次起始地址
+    total_size: usize,        // 需要读取的总大小（包含间隙）
+    items: Vec<BatchItemRef>, // 包含的地址引用
+}
+
+/// 批次内的地址引用
+#[derive(Debug, Clone, Copy)]
+struct BatchItemRef {
+    offset: usize,     // 在批次缓冲区中的偏移
+    item_index: usize, // 在原始 items 数组中的索引
+    value_size: usize, // 值大小
+}
+
+impl AddressBatch {
+    /// 创建新批次（包含单个地址）
+    fn new(start_addr: u64, size: usize, index: usize) -> Self {
+        Self {
+            start_addr,
+            total_size: size,
+            items: vec![BatchItemRef {
+                offset: 0,
+                item_index: index,
+                value_size: size,
+            }],
+        }
+    }
+}
 
 /// 模糊搜索初始扫描
 /// 记录指定内存区域内所有地址的当前值
@@ -167,7 +208,6 @@ fn scan_buffer_parallel(
 }
 
 /// 扫描单个页内的所有元素
-/// 纯粹的值收集，无比较操作，高度优化
 #[inline]
 fn scan_single_page(
     buffer: &[u8],
@@ -228,6 +268,183 @@ fn scan_single_page(
     results
 }
 
+/// 将有序的地址列表聚类为批次
+///
+/// 策略：
+/// - 相邻地址（间隙 < BATCH_MAX_GAP）合并为同一批次
+/// - 批次大小超过 BATCH_MAX_SIZE 时强制分割
+/// - 利用地址已排序的特性
+///
+/// # 参数
+/// * `items` - 有序的地址列表
+///
+/// # 返回
+/// 返回地址批次列表
+fn cluster_addresses(items: &[FuzzySearchResultItem]) -> Vec<AddressBatch> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+
+    let mut batches = Vec::new();
+    let mut current_batch: Option<AddressBatch> = None;
+
+    for (idx, item) in items.iter().enumerate() {
+        let addr = item.address;
+        let size = item.value_type.size();
+
+        match &mut current_batch {
+            Some(batch) => {
+                let batch_end = batch.start_addr + batch.total_size as u64;
+                let gap = addr.saturating_sub(batch_end);
+                let new_total_size = (addr + size as u64 - batch.start_addr) as usize;
+
+                // 决策：是否合并到当前批次
+                if gap <= BATCH_MAX_GAP && new_total_size <= BATCH_MAX_SIZE {
+                    // 合并：更新批次大小并添加地址引用
+                    batch.total_size = new_total_size;
+                    batch.items.push(BatchItemRef {
+                        offset: (addr - batch.start_addr) as usize,
+                        item_index: idx,
+                        value_size: size,
+                    });
+                } else {
+                    // 完成当前批次，开始新批次
+                    batches.push(current_batch.take().unwrap());
+                    current_batch = Some(AddressBatch::new(addr, size, idx));
+                }
+            },
+            None => {
+                // 首个批次
+                current_batch = Some(AddressBatch::new(addr, size, idx));
+            },
+        }
+    }
+
+    // 添加最后一个批次
+    if let Some(batch) = current_batch {
+        batches.push(batch);
+    }
+
+    batches
+}
+
+/// 并行批量读取内存
+///
+/// 使用 Rayon 并行处理各个批次，每个批次单次读取整段内存
+/// 批量读取失败时自动降级为逐个读取
+///
+/// # 参数
+/// * `batches` - 地址批次列表
+/// * `items` - 原始地址列表
+/// * `processed_counter` - 已处理计数器
+/// * `total_found_counter` - 找到总数计数器
+/// * `update_progress` - 进度更新回调
+/// * `check_cancelled` - 取消检查闭包
+///
+/// # 返回
+/// 返回成功读取的 (地址项, 当前值) 元组列表
+fn parallel_batch_read<P, F>(
+    batches: &[AddressBatch],
+    items: &[FuzzySearchResultItem],
+    processed_counter: Option<&Arc<AtomicUsize>>,
+    total_found_counter: Option<&Arc<AtomicUsize>>,
+    update_progress: &P,
+    check_cancelled: Option<&F>,
+) -> Result<Vec<(FuzzySearchResultItem, Vec<u8>)>>
+where
+    P: Fn(usize, usize) + Sync,
+    F: Fn() -> bool + Sync,
+{
+    let total_items = items.len();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_clone = Arc::clone(&cancelled);
+
+    // 并行处理批次
+    let results: Result<Vec<(FuzzySearchResultItem, Vec<u8>)>> = batches
+        .par_iter()
+        .enumerate()
+        .take_any_while(|&(_idx, _batch)| {
+            // 检查取消状态
+            if cancelled_clone.load(Ordering::Relaxed) {
+                return false;
+            }
+            if let Some(check_fn) = check_cancelled {
+                if check_fn() {
+                    cancelled_clone.store(true, Ordering::Relaxed);
+                    return false;
+                }
+            }
+            true
+        })
+        .try_fold(
+            || Vec::new(), // 线程本地累加器
+            |mut acc, (batch_idx, batch)| -> Result<Vec<(FuzzySearchResultItem, Vec<u8>)>> {
+                let driver_manager = DRIVER_MANAGER.read().map_err(|_| anyhow!("Failed to acquire DriverManager lock"))?;
+
+                // 分配批次缓冲区
+                let mut buffer = vec![0u8; batch.total_size];
+
+                // 单次批量读取整个段
+                match driver_manager.read_memory_unified(
+                    batch.start_addr,
+                    &mut buffer,
+                    None, // 不跟踪页状态
+                ) {
+                    Ok(_) => {
+                        // 从批次缓冲区提取各个地址的值
+                        for item_ref in &batch.items {
+                            let value_bytes = &buffer[item_ref.offset..item_ref.offset + item_ref.value_size];
+                            let original_item = &items[item_ref.item_index];
+                            acc.push((original_item.clone(), value_bytes.to_vec()));
+                        }
+                    },
+                    Err(e) => {
+                        if log_enabled!(Level::Debug) {
+                            debug!(
+                                "Batch read failed at 0x{:X} (size {}), falling back to individual reads: {:?}",
+                                batch.start_addr, batch.total_size, e
+                            );
+                        }
+
+                        // 逐个读取批次内的地址
+                        for item_ref in &batch.items {
+                            let original_item = &items[item_ref.item_index];
+                            let mut small_buffer = vec![0u8; item_ref.value_size];
+
+                            if driver_manager.read_memory_unified(original_item.address, &mut small_buffer, None).is_ok() {
+                                acc.push((original_item.clone(), small_buffer));
+                            }
+                        }
+                    },
+                }
+
+                drop(driver_manager); // 显式释放读锁
+
+                if batch_idx % PROGRESS_UPDATE_BATCH_SIZE == 0 {
+                    if let Some(counter) = processed_counter {
+                        let processed = counter.fetch_add(batch.items.len(), Ordering::Relaxed) + batch.items.len();
+                        let found = total_found_counter.map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
+                        update_progress(processed, found);
+                    }
+                } else if let Some(counter) = processed_counter {
+                    // 更新计数器
+                    counter.fetch_add(batch.items.len(), Ordering::Relaxed);
+                }
+
+                Ok(acc)
+            },
+        )
+        .try_reduce(
+            || Vec::new(),
+            |mut a, b| {
+                a.extend(b);
+                Ok(a)
+            },
+        );
+
+    results
+}
+
 /// 模糊搜索细化
 /// 读取已有结果的当前值，并根据条件过滤
 /// 返回新的 BPlusTreeSet
@@ -258,59 +475,31 @@ where
         return Ok(BPlusTreeSet::new(BPLUS_TREE_ORDER));
     }
 
-    let driver_manager = DRIVER_MANAGER.read().map_err(|_| anyhow!("Failed to acquire DriverManager lock"))?;
-
     let total_items = items.len();
 
-    // 顺序读取所有地址的当前值
-    let mut items_with_current_value: Vec<(FuzzySearchResultItem, Vec<u8>)> = Vec::with_capacity(total_items);
+    let batches = cluster_addresses(items);
 
-    for (idx, old_item) in items.iter().enumerate() {
-        // Check cancellation periodically (every 100 items)
-        if idx % 100 == 0 {
-            if let Some(check_fn) = check_cancelled {
-                if check_fn() {
-                    if log_enabled!(Level::Debug) {
-                        debug!("Fuzzy refine cancelled after checking {} items, returning {} partial matches", idx, items_with_current_value.len());
-                    }
-                    // Continue to parallel filtering with partial data
-                    break;
-                }
-            }
-        }
-
-        let element_size = old_item.value_type.size();
-        let mut buffer = vec![0u8; element_size];
-
-        // 读取当前值
-        if driver_manager.read_memory_unified(old_item.address, &mut buffer, None).is_ok() {
-            items_with_current_value.push((old_item.clone(), buffer));
-        }
-
-        // 更新已处理计数器和进度
-        if let Some(counter) = processed_counter {
-            let processed = counter.fetch_add(1, Ordering::Relaxed) + 1;
-            // 每处理 100 个项更新一次进度
-            if processed % 100 == 0 {
-                let found = total_found_counter
-                    .map(|c| c.load(Ordering::Relaxed))
-                    .unwrap_or(0);
-                update_progress(processed, found);
-            }
-        }
+    if log_enabled!(Level::Debug) {
+        debug!(
+            "Fuzzy refine: {} items -> {} batches (avg {:.1} items/batch)",
+            items.len(),
+            batches.len(),
+            items.len() as f64 / batches.len() as f64
+        );
     }
 
-    drop(driver_manager);
+    let items_with_current_value = parallel_batch_read(&batches, items, processed_counter, total_found_counter, update_progress, check_cancelled)?;
 
-    // Add cancellation support for parallel processing
+    if log_enabled!(Level::Debug) {
+        debug!("Fuzzy refine: read {} / {} items successfully", items_with_current_value.len(), total_items);
+    }
+
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancelled_clone = Arc::clone(&cancelled);
 
-    // 使用 rayon 并行匹配条件
     let matched: Vec<FuzzySearchResultItem> = items_with_current_value
         .par_iter()
         .take_any_while(|_| {
-            // Check cancellation in parallel context
             if cancelled_clone.load(Ordering::Relaxed) {
                 return false;
             }
@@ -323,20 +512,17 @@ where
             true
         })
         .filter_map(|(old_item, current_value)| {
-            // 检查是否满足条件
             if old_item.matches_condition(current_value, condition) {
-                // 更新找到数
                 if let Some(counter) = total_found_counter {
                     counter.fetch_add(1, Ordering::Relaxed);
                 }
-                // 创建新的结果项（包含新值）
-                return Some(FuzzySearchResultItem::from_bytes(old_item.address, current_value, old_item.value_type));
+                Some(FuzzySearchResultItem::from_bytes(old_item.address, current_value, old_item.value_type))
+            } else {
+                None
             }
-            None
         })
         .collect();
 
-    // 构建新的 BPlusTreeSet
     let mut results = BPlusTreeSet::new(BPLUS_TREE_ORDER);
     for item in matched {
         results.insert(item);
@@ -346,12 +532,10 @@ where
         debug!("Fuzzy refine: checked {} items, found {} matches", items.len(), results.len());
     }
 
-    // 更新总找到数
+    // 最终更新进度到 100%
     if let Some(counter) = total_found_counter {
         counter.store(results.len(), Ordering::Relaxed);
     }
-
-    // 最终更新进度到 100%
     update_progress(total_items, results.len());
 
     Ok(results)
