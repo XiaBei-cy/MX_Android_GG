@@ -40,6 +40,7 @@ import moe.fuqiuluo.mamu.floating.data.model.SavedAddress
 import moe.fuqiuluo.mamu.floating.dialog.AddressActionDialog
 import moe.fuqiuluo.mamu.floating.dialog.BatchModifyValueDialog
 import moe.fuqiuluo.mamu.floating.dialog.ModifyValueDialog
+import moe.fuqiuluo.mamu.floating.dialog.ModuleListDialog
 import moe.fuqiuluo.mamu.floating.event.AddressValueChangedEvent
 import moe.fuqiuluo.mamu.floating.event.FloatingEventBus
 import moe.fuqiuluo.mamu.floating.event.SaveMemoryPreviewEvent
@@ -69,6 +70,9 @@ class MemoryPreviewController(
         // ViewHolder 预创建数量
         private const val MEMORY_ROW_POOL_SIZE = 32
         private const val NAVIGATION_POOL_SIZE = 2
+        
+        // 导航历史最大数量
+        private const val MAX_NAVIGATION_HISTORY = 100
     }
 
     // 当前显示的格式列表
@@ -79,6 +83,11 @@ class MemoryPreviewController(
 
     // 当前跳转的目标地址（用于高亮显示）
     private var targetAddress: Long? = null
+
+    // 导航历史记录
+    private val navigationHistory = mutableListOf<Long>()
+    private var navigationIndex = -1
+    private var isNavigating = false  // 防止前进后退时重复添加历史
 
     // 缓存的内存区域列表（已分类和排序）
     private var memoryRegions: List<DisplayMemRegionEntry> = emptyList()
@@ -189,11 +198,19 @@ class MemoryPreviewController(
             },
 
             ToolbarAction(
+                id = 100,
+                icon = R.drawable.icon_goto_module_24px,
+                label = "转到"
+            ) {
+                showModuleListDialog()
+            },
+
+            ToolbarAction(
                 id = 200,
                 icon = R.drawable.icon_arrow_left_alt_24px,
                 label = "后退"
             ) {
-
+                navigateBack()
             },
 
             ToolbarAction(
@@ -201,7 +218,7 @@ class MemoryPreviewController(
                 icon = R.drawable.icon_arrow_right_alt_24px,
                 label = "前进"
             ) {
-
+                navigateForward()
             },
 
             ToolbarAction(
@@ -465,6 +482,21 @@ class MemoryPreviewController(
 
         // 计算页头地址（向下对齐到页边界，固定4KB页大小）
         val pageStartAddress = (requestedAddress / PAGE_SIZE) * PAGE_SIZE
+        
+        // 记录导航历史（仅在非前进后退操作时，且地址有变化）
+        if (!isNavigating) {
+            // 检查是否与当前历史位置的地址不同
+            val currentHistoryAddress = if (navigationIndex >= 0 && navigationIndex < navigationHistory.size) {
+                navigationHistory[navigationIndex]
+            } else {
+                -1L
+            }
+            
+            if (pageStartAddress != currentHistoryAddress) {
+                addToNavigationHistory(pageStartAddress)
+            }
+        }
+        
         currentStartAddress = pageStartAddress
 
         // 记录目标地址用于高亮
@@ -472,6 +504,64 @@ class MemoryPreviewController(
 
         // 加载页面
         loadPage(pageStartAddress, requestedAddress)
+    }
+    
+    /**
+     * 添加地址到导航历史
+     */
+    private fun addToNavigationHistory(address: Long) {
+        // 如果当前不在历史末尾，删除后面的记录
+        if (navigationIndex >= 0 && navigationIndex < navigationHistory.size - 1) {
+            navigationHistory.subList(navigationIndex + 1, navigationHistory.size).clear()
+        }
+        
+        // 避免连续重复地址
+        if (navigationHistory.isEmpty() || navigationHistory.last() != address) {
+            navigationHistory.add(address)
+            navigationIndex = navigationHistory.size - 1
+            
+            // 限制历史记录数量
+            while (navigationHistory.size > MAX_NAVIGATION_HISTORY) {
+                navigationHistory.removeAt(0)
+                navigationIndex--
+            }
+        }
+    }
+    
+    /**
+     * 后退到上一个地址
+     */
+    private fun navigateBack() {
+        if (navigationHistory.isEmpty() || navigationIndex <= 0) {
+            notification.showWarning("已经是最早的记录")
+            return
+        }
+        
+        isNavigating = true
+        navigationIndex--
+        val address = navigationHistory[navigationIndex]
+        jumpToPage(address)
+        isNavigating = false
+        
+        notification.showSuccess("后退 (${navigationIndex + 1}/${navigationHistory.size})")
+    }
+    
+    /**
+     * 前进到下一个地址
+     */
+    private fun navigateForward() {
+        if (navigationHistory.isEmpty() || navigationIndex >= navigationHistory.size - 1) {
+            notification.showWarning("已经是最新的记录")
+            return
+        }
+        
+        isNavigating = true
+        navigationIndex++
+        val address = navigationHistory[navigationIndex]
+        jumpToPage(address)
+        isNavigating = false
+        
+        notification.showSuccess("前进 (${navigationIndex + 1}/${navigationHistory.size})")
     }
 
     /**
@@ -1168,6 +1258,68 @@ class MemoryPreviewController(
                     initialBaseAddress = initialBaseAddress
                 )
             )
+        }
+    }
+
+    /**
+     * 显示模块内存列表对话框
+     * 用于快速跳转到指定模块的内存地址
+     */
+    private fun showModuleListDialog() {
+        if (!WuwaDriver.isProcessBound) {
+            notification.showError("未绑定进程")
+            return
+        }
+
+        val currentPid = WuwaDriver.currentBindPid
+        if (currentPid <= 0) {
+            notification.showError("无效的进程 PID")
+            return
+        }
+
+        // 先检查进程是否存活
+        if (!WuwaDriver.isProcessAlive(currentPid)) {
+            notification.showError("目标进程已退出 (PID: $currentPid)")
+            return
+        }
+
+        coroutineScope.launch {
+            try {
+                // 在后台线程查询内存区域（每次都获取最新数据）
+                val regions = withContext(Dispatchers.IO) {
+                    WuwaDriver.queryMemRegionsWithRetry(currentPid)
+                }
+
+                // 转换为 DisplayMemRegionEntry 并按地址排序（由小到大）
+                val modules = regions
+                    .map { DisplayMemRegionEntry.fromMemRegionEntry(it) }
+                    .sortedBy { it.start }
+
+                if (modules.isEmpty()) {
+                    notification.showWarning("未找到任何模块")
+                    return@launch
+                }
+
+                // 显示模块列表对话框
+                ModuleListDialog(
+                    context = context,
+                    modules = modules,
+                    onModuleSelected = { selectedModule ->
+                        // 跳转到选中模块的起始地址
+                        jumpToPage(selectedModule.start)
+                        notification.showSuccess("已跳转到: ${selectedModule.name.substringAfterLast("/")}")
+                    }
+                ).show()
+
+            } catch (e: Exception) {
+                Log.e(TAG, "加载模块列表失败", e)
+                // 检查是否是进程退出导致的
+                if (WuwaDriver.currentBindPid > 0 && !WuwaDriver.isProcessAlive(WuwaDriver.currentBindPid)) {
+                    notification.showError("目标进程已退出")
+                } else {
+                    notification.showError("加载模块列表失败: ${e.message ?: "未知错误"}")
+                }
+            }
         }
     }
 
