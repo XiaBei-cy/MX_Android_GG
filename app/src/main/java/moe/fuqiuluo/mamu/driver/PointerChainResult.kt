@@ -40,6 +40,9 @@ data class PointerChainResult(
      */
     fun toClipboardString(): String = chainString
 
+    val simpleChainString: String
+        get() = chainString.split("/").last()
+
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (javaClass != other?.javaClass) return false

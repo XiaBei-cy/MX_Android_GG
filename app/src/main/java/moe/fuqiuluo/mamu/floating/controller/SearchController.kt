@@ -1201,8 +1201,8 @@ class SearchController(
             pointerScanDialog = PointerScanDialog(
                 context = context,
                 notification = notification,
-                onScanCompleted = { chains ->
-                    onPointerScanCompleted(chains)
+                onScanCompleted = { ranges, chains ->
+                    onPointerScanCompleted(ranges, chains)
                 }
             ).apply {
                 onCancel = {
@@ -1216,7 +1216,7 @@ class SearchController(
         pointerScanDialog?.show()
     }
 
-    private fun onPointerScanCompleted(chains: List<PointerChainResult>) {
+    private fun onPointerScanCompleted(ranges: List<DisplayMemRegionEntry>, chains: List<PointerChainResult>) {
         // 清空现有搜索结果
         SearchEngine.clearSearchResults()
         searchResultAdapter.clearResults()
@@ -1226,7 +1226,7 @@ class SearchController(
             PointerChainResultItem(
                 nativePosition = index.toLong(),
                 address = chain.targetAddress,
-                chainString = chain.chainString,
+                chainString = chain.simpleChainString,
                 moduleName = chain.moduleName,
                 depth = chain.depth
             )
@@ -1234,7 +1234,7 @@ class SearchController(
 
         // 添加到适配器
         searchResultAdapter.setResults(pointerResults)
-        searchResultAdapter.setRanges(emptyList()) // 指针扫描结果不需要内存范围
+        searchResultAdapter.setRanges(ranges) // 指针扫描结果不需要内存范围
         updateSearchResultCount(pointerResults.size, pointerResults.size)
         showEmptyState(pointerResults.isEmpty())
 

@@ -20,6 +20,7 @@ import moe.fuqiuluo.mamu.driver.MemoryRegionInfo
 import moe.fuqiuluo.mamu.driver.PointerChainResult
 import moe.fuqiuluo.mamu.driver.PointerScanner
 import moe.fuqiuluo.mamu.driver.WuwaDriver
+import moe.fuqiuluo.mamu.floating.data.model.DisplayMemRegionEntry
 import moe.fuqiuluo.mamu.floating.data.model.MemoryRange
 import moe.fuqiuluo.mamu.floating.event.FloatingEventBus
 import moe.fuqiuluo.mamu.floating.event.UIActionEvent
@@ -35,16 +36,17 @@ import kotlin.math.min
 class PointerScanDialog(
     context: Context,
     private val notification: NotificationOverlay,
-    private val onScanCompleted: ((results: List<PointerChainResult>) -> Unit)? = null
+    private val onScanCompleted: ((ranges: List<DisplayMemRegionEntry>, results: List<PointerChainResult>) -> Unit)? = null
 ) : BaseDialog(context) {
     companion object {
         private const val TAG = "PointerScanDialog"
     }
-
     private val scanScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     // 扫描状态
     var isScanning = false
+
+    private lateinit var cacheMemoryRanges: List<DisplayMemRegionEntry>
 
     // 进度对话框
     private var progressDialog: PointerScanProgressDialog? = null
@@ -138,6 +140,8 @@ class PointerScanDialog(
                 }
                 return@launch
             }
+
+            cacheMemoryRanges = memRegions
 
             // 转换为 MemoryRegionInfo
             val regions = memRegions.map { region ->
@@ -248,7 +252,7 @@ class PointerScanDialog(
 
                 val chains = PointerScanner.getChains(0, actualCount)
                 withContext(Dispatchers.Main) {
-                    onScanCompleted?.invoke(chains.toList())
+                    onScanCompleted?.invoke(cacheMemoryRanges, chains.toList())
                 }
             }
         }
